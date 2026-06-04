@@ -15,5 +15,7 @@
     "OPENOCD_SCRIPTS": "C:\\Users\\lucas\\.espressif\\tools\\openocd-esp32\\v0.11.0-esp32-20211220/openocd-esp32/share/openocd/scripts",
     "IDF_CCACHE_ENABLE": "1",
     "IDF_TARGET": "esp32s3"
-  }
+  },
+  "idf.portWin": "COM9",
+  "idf.flashType": "UART"
 }

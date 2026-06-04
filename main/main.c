@@ -16,6 +16,8 @@
 
 #include "esp_log.h"
 #include "esp_err.h"
+#include "esp_check.h"
+#include "hd44780.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 
@@ -62,6 +64,9 @@ static const char *TAG = "TD3_PID";
 #define AS5600_REG_ANGLE_H  0x0E
 
 #define LCD_I2C_ADDR        0x27
+#define LCD_I2C_TIMEOUT_MS  50
+#define LCD_COLS            16
+#define LCD_ROWS            2
 
 // ============================================================
 // PWM LEDC
@@ -131,7 +136,8 @@ typedef enum {
 
 typedef struct {
     i2c_req_type_t type;
-    char lcd_text[32];
+    char lcd_line1[LCD_COLS + 1];
+    char lcd_line2[LCD_COLS + 1];
 } i2c_request_t;
 
 typedef struct {
@@ -151,6 +157,9 @@ typedef struct {
 typedef enum {
     DISPLAY_SHOW_MENU = 0,
     DISPLAY_SHOW_SETPOINT,
+    DISPLAY_SHOW_KP,
+    DISPLAY_SHOW_KI,
+    DISPLAY_SHOW_KD,
     DISPLAY_SHOW_PROFILE,
     DISPLAY_SHOW_MESSAGE
 } display_msg_type_t;
@@ -160,6 +169,15 @@ typedef struct {
     float value;
     char text[32];
 } display_msg_t;
+
+typedef enum {
+    MENU_ANGLE = 0,
+    MENU_KP,
+    MENU_KI,
+    MENU_KD,
+    MENU_PROFILE,
+    MENU_COUNT
+} ui_menu_t;
 
 typedef struct {
     float setpoint;
@@ -314,11 +332,78 @@ static esp_err_t as5600_read_raw(uint16_t *raw)
     return ESP_OK;
 }
 
-// Placeholder.
-// Después se reemplaza por driver real LCD 16x2 + PCF8574.
-static esp_err_t lcd_print_placeholder(const char *text)
+// LCD 16x2 sobre backpack PCF8574.
+// Solo I2C_Manager_Task llama a estas funciones.
+static hd44780_t lcd = {
+    .write_cb = NULL,
+    .font = HD44780_FONT_5X8,
+    .lines = LCD_ROWS,
+    .pins = {
+        .rs = 0,
+        .e = 2,
+        .d4 = 4,
+        .d5 = 5,
+        .d6 = 6,
+        .d7 = 7,
+        .bl = 3,
+    },
+};
+
+static esp_err_t lcd_write_cb(const hd44780_t *lcd_desc, uint8_t data)
 {
-    ESP_LOGI("LCD", "LCD: %s", text);
+    (void)lcd_desc;
+
+    return i2c_master_write_to_device(
+        I2C_PORT,
+        LCD_I2C_ADDR,
+        &data,
+        1,
+        pdMS_TO_TICKS(LCD_I2C_TIMEOUT_MS)
+    );
+}
+
+static void lcd_format_line(char *dst, const char *src)
+{
+    size_t len = 0;
+
+    memset(dst, ' ', LCD_COLS);
+    dst[LCD_COLS] = '\0';
+
+    while (src[len] != '\0' && len < LCD_COLS) {
+        dst[len] = src[len];
+        len++;
+    }
+}
+
+static esp_err_t lcd_write_line(uint8_t row, const char *text)
+{
+    char line[LCD_COLS + 1];
+
+    lcd_format_line(line, text);
+
+    ESP_RETURN_ON_ERROR(hd44780_gotoxy(&lcd, 0, row), TAG, "LCD gotoxy failed");
+    ESP_RETURN_ON_ERROR(hd44780_puts(&lcd, line), TAG, "LCD puts failed");
+
+    return ESP_OK;
+}
+
+static esp_err_t lcd_write_screen(const char *line1, const char *line2)
+{
+    ESP_RETURN_ON_ERROR(lcd_write_line(0, line1), TAG, "LCD line 1 failed");
+    ESP_RETURN_ON_ERROR(lcd_write_line(1, line2), TAG, "LCD line 2 failed");
+
+    return ESP_OK;
+}
+
+static esp_err_t lcd_init_driver(void)
+{
+    lcd.write_cb = lcd_write_cb;
+
+    ESP_RETURN_ON_ERROR(hd44780_init(&lcd), TAG, "LCD init failed");
+    ESP_RETURN_ON_ERROR(hd44780_switch_backlight(&lcd, true), TAG, "LCD backlight failed");
+    ESP_RETURN_ON_ERROR(hd44780_clear(&lcd), TAG, "LCD clear failed");
+    ESP_RETURN_ON_ERROR(lcd_write_screen("TD3 PID", "Sistema iniciado"), TAG, "LCD splash failed");
+
     return ESP_OK;
 }
 
@@ -407,6 +492,18 @@ static void I2C_Manager_Task(void *pvParameters)
 {
     i2c_request_t req;
     i2c_response_t resp;
+    bool lcd_ready = false;
+
+    (void)pvParameters;
+
+    esp_err_t lcd_ret = lcd_init_driver();
+
+    if (lcd_ret == ESP_OK) {
+        lcd_ready = true;
+        ESP_LOGI(TAG, "LCD inicializado");
+    } else {
+        ESP_LOGE(TAG, "No se pudo inicializar LCD: %s", esp_err_to_name(lcd_ret));
+    }
 
     while (1) {
         if (xQueueReceive(I2C_TXQueue, &req, portMAX_DELAY) == pdTRUE) {
@@ -425,8 +522,13 @@ static void I2C_Manager_Task(void *pvParameters)
                     break;
 
                 case I2C_REQ_LCD_PRINT:
-                    // Display solo escribe; no recibe respuesta por I2C_RXQueue.
-                    lcd_print_placeholder(req.lcd_text);
+                    if (lcd_ready) {
+                        esp_err_t ret = lcd_write_screen(req.lcd_line1, req.lcd_line2);
+
+                        if (ret != ESP_OK) {
+                            ESP_LOGE(TAG, "Error escribiendo LCD: %s", esp_err_to_name(ret));
+                        }
+                    }
                     break;
 
                 default:
@@ -882,49 +984,182 @@ static void UART_Command_Task(void *pvParameters)
 
 static void ButtonHandler_Task(void *pvParameters)
 {
+    ui_menu_t menu = MENU_ANGLE;
     float selected_angle = g_config.setpoint;
+    float selected_kp = g_config.kp;
+    float selected_ki = g_config.ki;
+    float selected_kd = g_config.kd;
     movement_profile_t selected_profile = g_config.profile;
 
     display_msg_t display_msg;
     control_cmd_t control_cmd;
     config_msg_t config_msg;
 
+    (void)pvParameters;
+
+    display_msg.type = DISPLAY_SHOW_SETPOINT;
+    display_msg.value = selected_angle;
+    snprintf(display_msg.text, sizeof(display_msg.text), "OK mueve");
+    xQueueSend(DisplayQueue, &display_msg, 0);
+
     while (1) {
-        if (xSemaphoreTake(sem_btn_plus, 0) == pdTRUE) {
-            selected_angle += 5.0f;
-            selected_angle = normalize_angle(selected_angle);
-
-            display_msg.type = DISPLAY_SHOW_SETPOINT;
-            display_msg.value = selected_angle;
-            snprintf(display_msg.text, sizeof(display_msg.text), "Angle %.1f", selected_angle);
-            xQueueSend(DisplayQueue, &display_msg, 0);
-
-            vTaskDelay(pdMS_TO_TICKS(150));
-        }
-
-        if (xSemaphoreTake(sem_btn_minus, 0) == pdTRUE) {
-            selected_angle -= 5.0f;
-            selected_angle = normalize_angle(selected_angle);
-
-            display_msg.type = DISPLAY_SHOW_SETPOINT;
-            display_msg.value = selected_angle;
-            snprintf(display_msg.text, sizeof(display_msg.text), "Angle %.1f", selected_angle);
-            xQueueSend(DisplayQueue, &display_msg, 0);
-
-            vTaskDelay(pdMS_TO_TICKS(150));
-        }
-
         if (xSemaphoreTake(sem_btn_menu, 0) == pdTRUE) {
-            selected_profile = (selected_profile == PROFILE_FAST) ? PROFILE_SMOOTH : PROFILE_FAST;
+            menu = (ui_menu_t)((menu + 1) % MENU_COUNT);
 
-            display_msg.type = DISPLAY_SHOW_PROFILE;
-            display_msg.value = (float)selected_profile;
-            snprintf(display_msg.text, sizeof(display_msg.text), "Profile %s",
-                     selected_profile == PROFILE_FAST ? "FAST" : "SMOOTH");
+            switch (menu) {
+                case MENU_ANGLE:
+                    display_msg.type = DISPLAY_SHOW_SETPOINT;
+                    display_msg.value = selected_angle;
+                    snprintf(display_msg.text, sizeof(display_msg.text), "OK mueve");
+                    break;
+
+                case MENU_KP:
+                    display_msg.type = DISPLAY_SHOW_KP;
+                    display_msg.value = selected_kp;
+                    break;
+
+                case MENU_KI:
+                    display_msg.type = DISPLAY_SHOW_KI;
+                    display_msg.value = selected_ki;
+                    break;
+
+                case MENU_KD:
+                    display_msg.type = DISPLAY_SHOW_KD;
+                    display_msg.value = selected_kd;
+                    break;
+
+                case MENU_PROFILE:
+                    display_msg.type = DISPLAY_SHOW_PROFILE;
+                    display_msg.value = (float)selected_profile;
+                    snprintf(display_msg.text, sizeof(display_msg.text), "%s",
+                             selected_profile == PROFILE_FAST ? "FAST" : "SMOOTH");
+                    break;
+
+                default:
+                    display_msg.type = DISPLAY_SHOW_MENU;
+                    break;
+            }
+
             xQueueSend(DisplayQueue, &display_msg, 0);
+            vTaskDelay(pdMS_TO_TICKS(150));
+        }
+
+        BaseType_t plus_pressed = xSemaphoreTake(sem_btn_plus, 0);
+        BaseType_t minus_pressed = xSemaphoreTake(sem_btn_minus, 0);
+
+        if (plus_pressed == pdTRUE || minus_pressed == pdTRUE) {
+            int direction = plus_pressed == pdTRUE ? 1 : -1;
+
+            switch (menu) {
+                case MENU_ANGLE:
+                    selected_angle += 5.0f * direction;
+                    selected_angle = normalize_angle(selected_angle);
+                    display_msg.type = DISPLAY_SHOW_SETPOINT;
+                    display_msg.value = selected_angle;
+                    snprintf(display_msg.text, sizeof(display_msg.text), "OK mueve");
+                    break;
+
+                case MENU_KP:
+                    selected_kp += 0.1f * direction;
+                    if (selected_kp < 0.0f) {
+                        selected_kp = 0.0f;
+                    }
+                    g_config.kp = selected_kp;
+                    control_cmd.type = CMD_SET_KP;
+                    control_cmd.value = selected_kp;
+                    xQueueSend(ControlQueue, &control_cmd, portMAX_DELAY);
+                    config_msg.type = CONFIG_SAVE_ALL;
+                    config_msg.config = g_config;
+                    xQueueSend(ConfigQueue, &config_msg, 0);
+                    display_msg.type = DISPLAY_SHOW_KP;
+                    display_msg.value = selected_kp;
+                    break;
+
+                case MENU_KI:
+                    selected_ki += 0.01f * direction;
+                    if (selected_ki < 0.0f) {
+                        selected_ki = 0.0f;
+                    }
+                    g_config.ki = selected_ki;
+                    control_cmd.type = CMD_SET_KI;
+                    control_cmd.value = selected_ki;
+                    xQueueSend(ControlQueue, &control_cmd, portMAX_DELAY);
+                    config_msg.type = CONFIG_SAVE_ALL;
+                    config_msg.config = g_config;
+                    xQueueSend(ConfigQueue, &config_msg, 0);
+                    display_msg.type = DISPLAY_SHOW_KI;
+                    display_msg.value = selected_ki;
+                    break;
+
+                case MENU_KD:
+                    selected_kd += 0.01f * direction;
+                    if (selected_kd < 0.0f) {
+                        selected_kd = 0.0f;
+                    }
+                    g_config.kd = selected_kd;
+                    control_cmd.type = CMD_SET_KD;
+                    control_cmd.value = selected_kd;
+                    xQueueSend(ControlQueue, &control_cmd, portMAX_DELAY);
+                    config_msg.type = CONFIG_SAVE_ALL;
+                    config_msg.config = g_config;
+                    xQueueSend(ConfigQueue, &config_msg, 0);
+                    display_msg.type = DISPLAY_SHOW_KD;
+                    display_msg.value = selected_kd;
+                    break;
+
+                case MENU_PROFILE:
+                    selected_profile = (selected_profile == PROFILE_FAST) ? PROFILE_SMOOTH : PROFILE_FAST;
+                    g_config.profile = selected_profile;
+                    control_cmd.type = CMD_SET_PROFILE;
+                    control_cmd.value = (float)selected_profile;
+                    xQueueSend(ControlQueue, &control_cmd, portMAX_DELAY);
+                    config_msg.type = CONFIG_SAVE_ALL;
+                    config_msg.config = g_config;
+                    xQueueSend(ConfigQueue, &config_msg, 0);
+                    display_msg.type = DISPLAY_SHOW_PROFILE;
+                    display_msg.value = (float)selected_profile;
+                    snprintf(display_msg.text, sizeof(display_msg.text), "%s",
+                             selected_profile == PROFILE_FAST ? "FAST" : "SMOOTH");
+                    break;
+
+                default:
+                    break;
+            }
+
+            xQueueSend(DisplayQueue, &display_msg, 0);
+            vTaskDelay(pdMS_TO_TICKS(150));
+        }
+
+        if (xSemaphoreTake(sem_btn_ok, 0) == pdTRUE) {
+            if (menu == MENU_ANGLE) {
+                control_cmd.type = CMD_SET_PROFILE;
+                control_cmd.value = (float)selected_profile;
+                xQueueSend(ControlQueue, &control_cmd, portMAX_DELAY);
+
+                control_cmd.type = CMD_SET_ANGLE;
+                control_cmd.value = selected_angle;
+                xQueueSend(ControlQueue, &control_cmd, portMAX_DELAY);
+
+                g_config.setpoint = selected_angle;
+                g_config.kp = selected_kp;
+                g_config.ki = selected_ki;
+                g_config.kd = selected_kd;
+                g_config.profile = selected_profile;
+
+                config_msg.type = CONFIG_SAVE_ALL;
+                config_msg.config = g_config;
+                xQueueSend(ConfigQueue, &config_msg, 0);
+
+                display_msg.type = DISPLAY_SHOW_MESSAGE;
+                snprintf(display_msg.text, sizeof(display_msg.text), "Moviendo %.1f", selected_angle);
+                xQueueSend(DisplayQueue, &display_msg, 0);
+            }
 
             vTaskDelay(pdMS_TO_TICKS(150));
         }
+
+        vTaskDelay(pdMS_TO_TICKS(20));
+        continue;
 
         if (xSemaphoreTake(sem_btn_ok, 0) == pdTRUE) {
             // Botón OK -> PID
@@ -972,20 +1207,40 @@ static void Display_Task(void *pvParameters)
 
             switch (msg.type) {
                 case DISPLAY_SHOW_SETPOINT:
-                    snprintf(req.lcd_text, sizeof(req.lcd_text), "Set: %.1f deg", msg.value);
+                    snprintf(req.lcd_line1, sizeof(req.lcd_line1), "Menu Angulo");
+                    snprintf(req.lcd_line2, sizeof(req.lcd_line2), "%.1f deg OK", msg.value);
+                    break;
+
+                case DISPLAY_SHOW_KP:
+                    snprintf(req.lcd_line1, sizeof(req.lcd_line1), "Menu Kp");
+                    snprintf(req.lcd_line2, sizeof(req.lcd_line2), "Kp %.2f", msg.value);
+                    break;
+
+                case DISPLAY_SHOW_KI:
+                    snprintf(req.lcd_line1, sizeof(req.lcd_line1), "Menu Ki");
+                    snprintf(req.lcd_line2, sizeof(req.lcd_line2), "Ki %.3f", msg.value);
+                    break;
+
+                case DISPLAY_SHOW_KD:
+                    snprintf(req.lcd_line1, sizeof(req.lcd_line1), "Menu Kd");
+                    snprintf(req.lcd_line2, sizeof(req.lcd_line2), "Kd %.3f", msg.value);
                     break;
 
                 case DISPLAY_SHOW_PROFILE:
-                    snprintf(req.lcd_text, sizeof(req.lcd_text), "%s", msg.text);
+                    snprintf(req.lcd_line1, sizeof(req.lcd_line1), "Menu Perfil");
+                    snprintf(req.lcd_line2, sizeof(req.lcd_line2), "%s",
+                             (movement_profile_t)((int)msg.value) == PROFILE_FAST ? "FAST" : "SMOOTH");
                     break;
 
                 case DISPLAY_SHOW_MESSAGE:
-                    snprintf(req.lcd_text, sizeof(req.lcd_text), "%s", msg.text);
+                    snprintf(req.lcd_line1, sizeof(req.lcd_line1), "Mensaje");
+                    snprintf(req.lcd_line2, sizeof(req.lcd_line2), "%.*s", LCD_COLS, msg.text);
                     break;
 
                 case DISPLAY_SHOW_MENU:
                 default:
-                    snprintf(req.lcd_text, sizeof(req.lcd_text), "Menu");
+                    snprintf(req.lcd_line1, sizeof(req.lcd_line1), "TD3 PID");
+                    snprintf(req.lcd_line2, sizeof(req.lcd_line2), "Menu");
                     break;
             }
 
