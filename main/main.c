@@ -553,6 +553,7 @@ static void AS5600_Reader_Task(void *pvParameters)
 
     i2c_response_t resp;
     float angle = 0.0f;
+    TickType_t last_log = 0;
 
     while (1) {
         xQueueSend(I2C_TXQueue, &req, portMAX_DELAY);
@@ -564,6 +565,13 @@ static void AS5600_Reader_Task(void *pvParameters)
 
                 // Cola de longitud 1: siempre queda la última posición.
                 xQueueOverwrite(angleQueue, &angle);
+
+                TickType_t now = xTaskGetTickCount();
+
+                if ((now - last_log) >= pdMS_TO_TICKS(500)) {
+                    ESP_LOGI(TAG, "AS5600 raw=%u angle=%.2f deg", (unsigned)resp.as5600_raw, angle);
+                    last_log = now;
+                }
             } else {
                 ESP_LOGW(TAG, "Fallo lectura AS5600");
             }
