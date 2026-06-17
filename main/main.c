@@ -108,8 +108,11 @@ static const char *TAG = "TD3_PID";
 // ============================================================
 
 typedef enum {
-    PROFILE_FAST = 0,
-    PROFILE_SMOOTH
+    PROFILE_ESCALON = 0,
+    PROFILE_RAMPA,
+
+    PROFILE_FAST = PROFILE_ESCALON,
+    PROFILE_SMOOTH = PROFILE_RAMPA
 } movement_profile_t;
 
 typedef enum {
@@ -131,6 +134,7 @@ typedef struct {
 
 typedef enum {
     I2C_REQ_READ_AS5600 = 0,
+    I2C_REQ_LCD_INIT,
     I2C_REQ_LCD_PRINT
 } i2c_req_type_t;
 
@@ -223,7 +227,7 @@ static system_config_t g_config = {
     .kp = 6.0f,
     .ki = 0.0f,
     .kd = 0.25f,
-    .profile = PROFILE_FAST
+    .profile = PROFILE_ESCALON
 };
 
 // ============================================================
@@ -496,15 +500,6 @@ static void I2C_Manager_Task(void *pvParameters)
 
     (void)pvParameters;
 
-    esp_err_t lcd_ret = lcd_init_driver();
-
-    if (lcd_ret == ESP_OK) {
-        lcd_ready = true;
-        ESP_LOGI(TAG, "LCD inicializado");
-    } else {
-        ESP_LOGE(TAG, "No se pudo inicializar LCD: %s", esp_err_to_name(lcd_ret));
-    }
-
     while (1) {
         if (xQueueReceive(I2C_TXQueue, &req, portMAX_DELAY) == pdTRUE) {
             memset(&resp, 0, sizeof(resp));
@@ -520,6 +515,18 @@ static void I2C_Manager_Task(void *pvParameters)
                     // I2C_RXQueue solo se usa para responder al AS5600_Reader_Task.
                     xQueueSend(I2C_RXQueue, &resp, portMAX_DELAY);
                     break;
+
+                case I2C_REQ_LCD_INIT: {
+                    esp_err_t ret = lcd_init_driver();
+
+                    if (ret == ESP_OK) {
+                        lcd_ready = true;
+                        ESP_LOGI(TAG, "LCD inicializado");
+                    } else {
+                        ESP_LOGE(TAG, "No se pudo inicializar LCD: %s", esp_err_to_name(ret));
+                    }
+                    break;
+                }
 
                 case I2C_REQ_LCD_PRINT:
                     if (lcd_ready) {
@@ -757,8 +764,8 @@ static void PID_Task(void *pvParameters)
 
             output = kp * error + ki * integral + kd * derivative;
 
-            // Perfil suave: reduce la salida del controlador.
-            if (profile == PROFILE_SMOOTH) {
+            // Perfil RAMPA: reduce la salida del controlador.
+            if (profile == PROFILE_RAMPA) {
                 output *= 0.6f;
             }
 
@@ -923,35 +930,37 @@ static void UART_Command_Task(void *pvParameters)
                 xQueueSend(DisplayQueue, &display_msg, 0);
             }
 
-            else if (strstr((char *)data, "SET PROFILE FAST") != NULL) {
+            else if (strstr((char *)data, "SET PROFILE ESCALON") != NULL ||
+                     strstr((char *)data, "SET PROFILE FAST") != NULL) {
                 control_cmd.type = CMD_SET_PROFILE;
-                control_cmd.value = PROFILE_FAST;
+                control_cmd.value = PROFILE_ESCALON;
                 xQueueSend(ControlQueue, &control_cmd, portMAX_DELAY);
 
-                g_config.profile = PROFILE_FAST;
+                g_config.profile = PROFILE_ESCALON;
                 config_msg.type = CONFIG_SAVE_ALL;
                 config_msg.config = g_config;
                 xQueueSend(ConfigQueue, &config_msg, portMAX_DELAY);
 
                 display_msg.type = DISPLAY_SHOW_PROFILE;
-                display_msg.value = PROFILE_FAST;
-                snprintf(display_msg.text, sizeof(display_msg.text), "Profile FAST");
+                display_msg.value = PROFILE_ESCALON;
+                snprintf(display_msg.text, sizeof(display_msg.text), "ESCALON");
                 xQueueSend(DisplayQueue, &display_msg, 0);
             }
 
-            else if (strstr((char *)data, "SET PROFILE SMOOTH") != NULL) {
+            else if (strstr((char *)data, "SET PROFILE RAMPA") != NULL ||
+                     strstr((char *)data, "SET PROFILE SMOOTH") != NULL) {
                 control_cmd.type = CMD_SET_PROFILE;
-                control_cmd.value = PROFILE_SMOOTH;
+                control_cmd.value = PROFILE_RAMPA;
                 xQueueSend(ControlQueue, &control_cmd, portMAX_DELAY);
 
-                g_config.profile = PROFILE_SMOOTH;
+                g_config.profile = PROFILE_RAMPA;
                 config_msg.type = CONFIG_SAVE_ALL;
                 config_msg.config = g_config;
                 xQueueSend(ConfigQueue, &config_msg, portMAX_DELAY);
 
                 display_msg.type = DISPLAY_SHOW_PROFILE;
-                display_msg.value = PROFILE_SMOOTH;
-                snprintf(display_msg.text, sizeof(display_msg.text), "Profile SMOOTH");
+                display_msg.value = PROFILE_RAMPA;
+                snprintf(display_msg.text, sizeof(display_msg.text), "RAMPA");
                 xQueueSend(DisplayQueue, &display_msg, 0);
             }
 
@@ -1040,7 +1049,7 @@ static void ButtonHandler_Task(void *pvParameters)
                     display_msg.type = DISPLAY_SHOW_PROFILE;
                     display_msg.value = (float)selected_profile;
                     snprintf(display_msg.text, sizeof(display_msg.text), "%s",
-                             selected_profile == PROFILE_FAST ? "FAST" : "SMOOTH");
+                             selected_profile == PROFILE_ESCALON ? "ESCALON" : "RAMPA");
                     break;
 
                 default:
@@ -1116,7 +1125,7 @@ static void ButtonHandler_Task(void *pvParameters)
                     break;
 
                 case MENU_PROFILE:
-                    selected_profile = (selected_profile == PROFILE_FAST) ? PROFILE_SMOOTH : PROFILE_FAST;
+                    selected_profile = (selected_profile == PROFILE_ESCALON) ? PROFILE_RAMPA : PROFILE_ESCALON;
                     g_config.profile = selected_profile;
                     control_cmd.type = CMD_SET_PROFILE;
                     control_cmd.value = (float)selected_profile;
@@ -1127,7 +1136,7 @@ static void ButtonHandler_Task(void *pvParameters)
                     display_msg.type = DISPLAY_SHOW_PROFILE;
                     display_msg.value = (float)selected_profile;
                     snprintf(display_msg.text, sizeof(display_msg.text), "%s",
-                             selected_profile == PROFILE_FAST ? "FAST" : "SMOOTH");
+                             selected_profile == PROFILE_ESCALON ? "ESCALON" : "RAMPA");
                     break;
 
                 default:
@@ -1208,6 +1217,18 @@ static void Display_Task(void *pvParameters)
     display_msg_t msg;
     i2c_request_t req;
 
+    (void)pvParameters;
+
+    memset(&req, 0, sizeof(req));
+    req.type = I2C_REQ_LCD_INIT;
+    xQueueSend(I2C_TXQueue, &req, portMAX_DELAY);
+
+    memset(&req, 0, sizeof(req));
+    req.type = I2C_REQ_LCD_PRINT;
+    snprintf(req.lcd_line1, sizeof(req.lcd_line1), "Menu Angulo");
+    snprintf(req.lcd_line2, sizeof(req.lcd_line2), "%.1f deg OK", g_config.setpoint);
+    xQueueSend(I2C_TXQueue, &req, portMAX_DELAY);
+
     while (1) {
         if (xQueueReceive(DisplayQueue, &msg, portMAX_DELAY) == pdTRUE) {
             memset(&req, 0, sizeof(req));
@@ -1237,7 +1258,7 @@ static void Display_Task(void *pvParameters)
                 case DISPLAY_SHOW_PROFILE:
                     snprintf(req.lcd_line1, sizeof(req.lcd_line1), "Menu Perfil");
                     snprintf(req.lcd_line2, sizeof(req.lcd_line2), "%s",
-                             (movement_profile_t)((int)msg.value) == PROFILE_FAST ? "FAST" : "SMOOTH");
+                             (movement_profile_t)((int)msg.value) == PROFILE_ESCALON ? "ESCALON" : "RAMPA");
                     break;
 
                 case DISPLAY_SHOW_MESSAGE:
