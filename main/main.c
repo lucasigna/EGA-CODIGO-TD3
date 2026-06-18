@@ -48,6 +48,7 @@ static const char *TAG = "TD3_PID";
 #define PIN_BTN_MINUS       GPIO_NUM_11
 #define PIN_BTN_MENU        GPIO_NUM_12
 #define PIN_BTN_OK          GPIO_NUM_13
+#define BUTTON_DEBOUNCE_MS  180
 
 // UART comandos PC
 #define PIN_UART_TX         GPIO_NUM_17
@@ -93,15 +94,23 @@ static const char *TAG = "TD3_PID";
 #define PID_PERIOD_MS       10
 #define AS5600_PERIOD_MS    10
 
-#define ANGLE_TOLERANCE_DEG 2.0f
+#define ANGLE_TOLERANCE_DEG 1.0f
 
 #define PWM_MAX             1023.0f
 #define PWM_MIN             150.0f
+#define PWM_MOVE_MIN        750.0f
+#define PWM_START_BOOST     900.0f
+#define PWM_START_BOOST_MS  300
+#define TARGET_VERIFY_MS    120
+#define FINE_CONTROL_ZONE_DEG 8.0f
+#define FINE_PULSE_MS       25
+#define FINE_BRAKE_MS       180
 
 #define BLOCK_PWM_MIN       250.0f
-#define BLOCK_ERROR_MIN     5.0f
-#define BLOCK_DELTA_MIN     1.0f
-#define BLOCK_COUNTER_LIMIT 50
+#define BLOCK_ERROR_MIN     20.0f
+#define BLOCK_DELTA_MIN     2.0f
+#define BLOCK_START_GRACE_MS 1500
+#define BLOCK_CHECK_PERIOD_MS 1000
 
 // ============================================================
 // TIPOS
@@ -218,6 +227,11 @@ static SemaphoreHandle_t sem_btn_minus;
 static SemaphoreHandle_t sem_btn_menu;
 static SemaphoreHandle_t sem_btn_ok;
 
+static volatile TickType_t last_btn_plus_tick;
+static volatile TickType_t last_btn_minus_tick;
+static volatile TickType_t last_btn_menu_tick;
+static volatile TickType_t last_btn_ok_tick;
+
 // ============================================================
 // CONFIGURACIÓN GLOBAL
 // ============================================================
@@ -233,6 +247,12 @@ static system_config_t g_config = {
 // ============================================================
 // FUNCIONES AUXILIARES
 // ============================================================
+
+static void drain_button_semaphore(SemaphoreHandle_t sem)
+{
+    while (xSemaphoreTake(sem, 0) == pdTRUE) {
+    }
+}
 
 static float normalize_angle(float angle)
 {
@@ -278,6 +298,15 @@ static void motor_stop(void)
 
     gpio_set_level(PIN_MOTOR_IN1, 0);
     gpio_set_level(PIN_MOTOR_IN2, 0);
+}
+
+static void motor_brake(void)
+{
+    gpio_set_level(PIN_MOTOR_IN1, 1);
+    gpio_set_level(PIN_MOTOR_IN2, 1);
+
+    ledc_set_duty(LEDC_MODE_USED, LEDC_CHANNEL_USED, LEDC_MAX_DUTY);
+    ledc_update_duty(LEDC_MODE_USED, LEDC_CHANNEL_USED);
 }
 
 static void motor_apply(float control_signal)
@@ -473,16 +502,30 @@ static bool load_config_from_nvs(system_config_t *cfg)
 static void IRAM_ATTR gpio_button_isr_handler(void *arg)
 {
     gpio_num_t pin = (gpio_num_t)(uint32_t)arg;
+    TickType_t now = xTaskGetTickCountFromISR();
+    TickType_t debounce_ticks = pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS);
+    volatile TickType_t *last_tick = NULL;
+    SemaphoreHandle_t sem = NULL;
     BaseType_t higher_priority_task_woken = pdFALSE;
 
     if (pin == PIN_BTN_PLUS) {
-        xSemaphoreGiveFromISR(sem_btn_plus, &higher_priority_task_woken);
+        sem = sem_btn_plus;
+        last_tick = &last_btn_plus_tick;
     } else if (pin == PIN_BTN_MINUS) {
-        xSemaphoreGiveFromISR(sem_btn_minus, &higher_priority_task_woken);
+        sem = sem_btn_minus;
+        last_tick = &last_btn_minus_tick;
     } else if (pin == PIN_BTN_MENU) {
-        xSemaphoreGiveFromISR(sem_btn_menu, &higher_priority_task_woken);
+        sem = sem_btn_menu;
+        last_tick = &last_btn_menu_tick;
     } else if (pin == PIN_BTN_OK) {
-        xSemaphoreGiveFromISR(sem_btn_ok, &higher_priority_task_woken);
+        sem = sem_btn_ok;
+        last_tick = &last_btn_ok_tick;
+    }
+
+    if (sem != NULL && last_tick != NULL &&
+        (*last_tick == 0 || (now - *last_tick) >= debounce_ticks)) {
+        *last_tick = now;
+        xSemaphoreGiveFromISR(sem, &higher_priority_task_woken);
     }
 
     portYIELD_FROM_ISR(higher_priority_task_woken);
@@ -614,24 +657,45 @@ static void PID_Task(void *pvParameters)
     float integral = 0.0f;
     float derivative = 0.0f;
     float output = 0.0f;
+    TickType_t last_pid_log = 0;
+    TickType_t start_boost_until = 0;
+    TickType_t target_verify_until = 0;
+    TickType_t fine_pulse_until = 0;
+    TickType_t fine_brake_until = 0;
 
     bool moving = false;
-    bool force_reverse = false;
+    bool hold_brake = false;
+    bool verifying_target = false;
 
     while (1) {
         if (!moving) {
-            motor_stop();
+            if (hold_brake) {
+                motor_brake();
+            } else {
+                motor_stop();
+            }
 
             if (xQueueReceive(ControlQueue, &cmd, portMAX_DELAY) == pdTRUE) {
                 switch (cmd.type) {
-                    case CMD_SET_ANGLE:
+                    case CMD_SET_ANGLE: {
+                        float current_position = 0.0f;
+
                         setpoint = normalize_angle(cmd.value);
                         integral = 0.0f;
-                        previous_error = 0.0f;
+                        hold_brake = false;
+                        verifying_target = false;
+                        fine_pulse_until = 0;
+                        fine_brake_until = 0;
+                        if (xQueuePeek(angleQueue, &current_position, 0) == pdTRUE) {
+                            previous_error = calculate_angular_error(setpoint, current_position);
+                        } else {
+                            previous_error = 0.0f;
+                        }
+                        start_boost_until = xTaskGetTickCount() + pdMS_TO_TICKS(PWM_START_BOOST_MS);
                         moving = true;
-                        force_reverse = false;
                         ESP_LOGI(TAG, "Nuevo setpoint y movimiento: %.2f", setpoint);
                         break;
+                    }
 
                     case CMD_SET_KP:
                         kp = cmd.value;
@@ -665,6 +729,10 @@ static void PID_Task(void *pvParameters)
                     case CMD_STOP:
                         motor_stop();
                         moving = false;
+                        hold_brake = false;
+                        verifying_target = false;
+                        fine_pulse_until = 0;
+                        fine_brake_until = 0;
                         break;
 
                     default:
@@ -677,18 +745,38 @@ static void PID_Task(void *pvParameters)
                 switch (cmd.type) {
                     case CMD_STOP:
                         moving = false;
-                        force_reverse = false;
+                        hold_brake = false;
+                        verifying_target = false;
+                        fine_pulse_until = 0;
+                        fine_brake_until = 0;
                         motor_stop();
                         ESP_LOGI(TAG, "STOP recibido");
                         break;
 
-                    case CMD_SET_ANGLE:
-                        setpoint = normalize_angle(cmd.value);
+                    case CMD_SET_ANGLE: {
+                        float new_setpoint = normalize_angle(cmd.value);
+                        float current_position = 0.0f;
+
+                        if (fabsf(calculate_angular_error(new_setpoint, setpoint)) < 0.01f) {
+                            ESP_LOGI(TAG, "Setpoint duplicado ignorado: %.2f", new_setpoint);
+                            break;
+                        }
+
+                        setpoint = new_setpoint;
                         integral = 0.0f;
-                        previous_error = 0.0f;
-                        force_reverse = false;
+                        hold_brake = false;
+                        verifying_target = false;
+                        fine_pulse_until = 0;
+                        fine_brake_until = 0;
+                        if (xQueuePeek(angleQueue, &current_position, 0) == pdTRUE) {
+                            previous_error = calculate_angular_error(setpoint, current_position);
+                        } else {
+                            previous_error = 0.0f;
+                        }
+                        start_boost_until = xTaskGetTickCount() + pdMS_TO_TICKS(PWM_START_BOOST_MS);
                         ESP_LOGI(TAG, "Nuevo setpoint durante movimiento: %.2f", setpoint);
                         break;
+                    }
 
                     case CMD_SET_KP:
                         kp = cmd.value;
@@ -707,10 +795,13 @@ static void PID_Task(void *pvParameters)
                         break;
 
                     case CMD_BLOCK_DETECTED:
+                        ESP_LOGW(TAG, "Bloqueo detectado ignorado. Motor sigue activo.");
+                        break;
+
                     case CMD_REVERSE:
-                        force_reverse = true;
-                        integral = 0.0f;
-                        ESP_LOGW(TAG, "Bloqueo detectado. Forzando sentido contrario.");
+                        output = -output;
+                        motor_apply(output);
+                        ESP_LOGW(TAG, "CMD_REVERSE recibido");
                         break;
 
                     case CMD_LOAD_CONFIG:
@@ -738,13 +829,44 @@ static void PID_Task(void *pvParameters)
 
             error = calculate_angular_error(setpoint, position);
 
-            // Ante bloqueo se intenta el camino contrario, aunque no sea el menor.
-            if (force_reverse) {
-                if (error > 0.0f) {
-                    error = error - 360.0f;
-                } else {
-                    error = error + 360.0f;
+            if (verifying_target) {
+                TickType_t now = xTaskGetTickCount();
+
+                motor_brake();
+                output = 0.0f;
+                integral = 0.0f;
+                previous_error = error;
+
+                if ((int32_t)(now - target_verify_until) >= 0) {
+                    if (fabsf(error) <= ANGLE_TOLERANCE_DEG) {
+                        display_msg_t display_msg;
+
+                        moving = false;
+                        hold_brake = true;
+                        verifying_target = false;
+
+                        ESP_LOGI(TAG, "Objetivo alcanzado. Posicion: %.2f", position);
+                        display_msg.type = DISPLAY_SHOW_MESSAGE;
+                        display_msg.value = position;
+                        snprintf(display_msg.text, sizeof(display_msg.text), "OK %.1f deg", position);
+                        xQueueSend(DisplayQueue, &display_msg, 0);
+                    } else {
+                        verifying_target = false;
+                        ESP_LOGI(TAG, "Objetivo se movio durante verificacion. Retomando PID: %.2f", position);
+                    }
                 }
+
+                motor_state.setpoint = setpoint;
+                motor_state.position = position;
+                motor_state.error = error;
+                motor_state.pwm = 0.0f;
+                motor_state.direction = 0;
+                motor_state.moving = moving;
+
+                xQueueOverwrite(MotorStateQueue, &motor_state);
+
+                vTaskDelayUntil(&last_wake, period);
+                continue;
             }
 
             float dt = PID_PERIOD_MS / 1000.0f;
@@ -770,15 +892,62 @@ static void PID_Task(void *pvParameters)
             }
 
             if (fabsf(error) <= ANGLE_TOLERANCE_DEG) {
-                motor_stop();
-                moving = false;
-                force_reverse = false;
-                integral = 0.0f;
-                previous_error = 0.0f;
+                TickType_t now = xTaskGetTickCount();
 
-                ESP_LOGI(TAG, "Objetivo alcanzado. Posición: %.2f", position);
+                motor_brake();
+                integral = 0.0f;
+                previous_error = error;
+                output = 0.0f;
+
+                if (!verifying_target) {
+                    verifying_target = true;
+                    target_verify_until = now + pdMS_TO_TICKS(TARGET_VERIFY_MS);
+                    ESP_LOGI(TAG, "Objetivo en rango. Verificando posicion: %.2f", position);
+                }
             } else {
-                motor_apply(output);
+                verifying_target = false;
+
+                TickType_t control_now = xTaskGetTickCount();
+
+                if (fabsf(error) <= FINE_CONTROL_ZONE_DEG) {
+                    if (fine_brake_until != 0 &&
+                        (int32_t)(control_now - fine_brake_until) < 0) {
+                        output = 0.0f;
+                        motor_brake();
+                    } else {
+                        fine_brake_until = 0;
+
+                        if (fine_pulse_until == 0) {
+                            fine_pulse_until = control_now + pdMS_TO_TICKS(FINE_PULSE_MS);
+                        }
+
+                        if ((int32_t)(control_now - fine_pulse_until) < 0) {
+                            output = (error >= 0.0f) ? PWM_MOVE_MIN : -PWM_MOVE_MIN;
+                            motor_apply(output);
+                        } else {
+                            fine_pulse_until = 0;
+                            fine_brake_until = control_now + pdMS_TO_TICKS(FINE_BRAKE_MS);
+                            output = 0.0f;
+                            motor_brake();
+                        }
+                    }
+                } else {
+                    fine_pulse_until = 0;
+                    fine_brake_until = 0;
+
+                    float min_output = PWM_MOVE_MIN;
+
+                    if (fabsf(output) < min_output) {
+                        output = (output >= 0.0f) ? min_output : -min_output;
+                    }
+
+                    if (control_now < start_boost_until &&
+                        fabsf(output) < PWM_START_BOOST) {
+                        output = (output >= 0.0f) ? PWM_START_BOOST : -PWM_START_BOOST;
+                    }
+
+                    motor_apply(output);
+                }
             }
 
             previous_error = error;
@@ -792,6 +961,17 @@ static void PID_Task(void *pvParameters)
 
             xQueueOverwrite(MotorStateQueue, &motor_state);
 
+            TickType_t now = xTaskGetTickCount();
+            if ((now - last_pid_log) >= pdMS_TO_TICKS(250)) {
+                ESP_LOGI(TAG, "PID sp=%.2f pos=%.2f err=%.2f out=%.2f dir=%d",
+                         setpoint,
+                         position,
+                         error,
+                         output,
+                         motor_state.direction);
+                last_pid_log = now;
+            }
+
             vTaskDelayUntil(&last_wake, period);
         }
     }
@@ -804,12 +984,34 @@ static void PID_Task(void *pvParameters)
 static void Safety_Task(void *pvParameters)
 {
     motor_state_t state;
-    float last_position = 0.0f;
-    int block_counter = 0;
+    float reference_position = 0.0f;
+    bool was_moving = false;
+    TickType_t movement_start_tick = 0;
+    TickType_t last_check_tick = 0;
 
     while (1) {
         if (xQueueReceive(MotorStateQueue, &state, portMAX_DELAY) == pdTRUE) {
-            float delta = fabsf(state.position - last_position);
+            TickType_t now = xTaskGetTickCount();
+
+            if (!state.moving) {
+                was_moving = false;
+                continue;
+            }
+
+            if (!was_moving) {
+                was_moving = true;
+                movement_start_tick = now;
+                last_check_tick = now;
+                reference_position = state.position;
+                continue;
+            }
+
+            if ((now - movement_start_tick) < pdMS_TO_TICKS(BLOCK_START_GRACE_MS) ||
+                (now - last_check_tick) < pdMS_TO_TICKS(BLOCK_CHECK_PERIOD_MS)) {
+                continue;
+            }
+
+            float delta = fabsf(state.position - reference_position);
 
             if (delta > 180.0f) {
                 delta = 360.0f - delta;
@@ -819,25 +1021,14 @@ static void Safety_Task(void *pvParameters)
                 state.pwm > BLOCK_PWM_MIN &&
                 fabsf(state.error) > BLOCK_ERROR_MIN &&
                 delta < BLOCK_DELTA_MIN) {
-
-                block_counter++;
-            } else {
-                block_counter = 0;
+                ESP_LOGW(TAG, "Safety_Task: posible bloqueo detectado sin detener motor, delta=%.2f err=%.2f pwm=%.1f",
+                         delta,
+                         state.error,
+                         state.pwm);
             }
 
-            if (block_counter >= BLOCK_COUNTER_LIMIT) {
-                control_cmd_t cmd = {
-                    .type = CMD_BLOCK_DETECTED,
-                    .value = 0.0f
-                };
-
-                xQueueSend(ControlQueue, &cmd, 0);
-                block_counter = 0;
-
-                ESP_LOGW(TAG, "Safety_Task: posible bloqueo detectado");
-            }
-
-            last_position = state.position;
+            reference_position = state.position;
+            last_check_tick = now;
         }
     }
 }
@@ -1059,6 +1250,10 @@ static void ButtonHandler_Task(void *pvParameters)
 
             xQueueSend(DisplayQueue, &display_msg, 0);
             vTaskDelay(pdMS_TO_TICKS(150));
+            drain_button_semaphore(sem_btn_plus);
+            drain_button_semaphore(sem_btn_minus);
+            drain_button_semaphore(sem_btn_ok);
+            continue;
         }
 
         BaseType_t plus_pressed = xSemaphoreTake(sem_btn_plus, 0);
@@ -1145,6 +1340,9 @@ static void ButtonHandler_Task(void *pvParameters)
 
             xQueueSend(DisplayQueue, &display_msg, 0);
             vTaskDelay(pdMS_TO_TICKS(150));
+            drain_button_semaphore(sem_btn_menu);
+            drain_button_semaphore(sem_btn_ok);
+            continue;
         }
 
         if (xSemaphoreTake(sem_btn_ok, 0) == pdTRUE) {
@@ -1173,6 +1371,11 @@ static void ButtonHandler_Task(void *pvParameters)
             }
 
             vTaskDelay(pdMS_TO_TICKS(150));
+            drain_button_semaphore(sem_btn_plus);
+            drain_button_semaphore(sem_btn_minus);
+            drain_button_semaphore(sem_btn_menu);
+            drain_button_semaphore(sem_btn_ok);
+            continue;
         }
 
         vTaskDelay(pdMS_TO_TICKS(20));
@@ -1387,9 +1590,9 @@ static void init_gpio(void)
                         (1ULL << PIN_BTN_MENU) |
                         (1ULL << PIN_BTN_OK),
         .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_NEGEDGE
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,
+        .intr_type = GPIO_INTR_POSEDGE
     };
 
     ESP_ERROR_CHECK(gpio_config(&btn_conf));
@@ -1484,6 +1687,21 @@ void app_main(void)
     }
 
     ESP_ERROR_CHECK(ret);
+
+    system_config_t saved_config;
+    if (load_config_from_nvs(&saved_config)) {
+        g_config = saved_config;
+
+        ESP_LOGI(TAG, "Configuracion inicial desde NVS");
+        ESP_LOGI(TAG, "Setpoint: %.2f | Kp: %.2f | Ki: %.3f | Kd: %.2f | Profile: %d",
+                 g_config.setpoint,
+                 g_config.kp,
+                 g_config.ki,
+                 g_config.kd,
+                 g_config.profile);
+    } else {
+        ESP_LOGW(TAG, "No habia configuracion guardada. Se usan valores por defecto.");
+    }
 
     init_gpio();
     init_i2c();
