@@ -50,6 +50,9 @@ static const char *TAG = "TD3_PID";
 #define PIN_BTN_OK          GPIO_NUM_13
 #define BUTTON_DEBOUNCE_MS  180
 
+// Convencion mecanica: los angulos deben aumentar en sentido antihorario.
+#define ANGLE_CCW_POSITIVE  1
+
 // UART comandos PC
 #define PIN_UART_TX         GPIO_NUM_17
 #define PIN_UART_RX         GPIO_NUM_18
@@ -284,7 +287,13 @@ static float calculate_angular_error(float setpoint, float position)
 
 static float raw_to_degrees(uint16_t raw)
 {
-    return ((float)raw * 360.0f) / 4096.0f;
+    float angle = ((float)raw * 360.0f) / 4096.0f;
+
+#if ANGLE_CCW_POSITIVE
+    angle = 360.0f - angle;
+#endif
+
+    return normalize_angle(angle);
 }
 
 // ============================================================
@@ -312,6 +321,11 @@ static void motor_brake(void)
 static void motor_apply(float control_signal)
 {
     float pwm = fabsf(control_signal);
+    float motor_signal = control_signal;
+
+#if ANGLE_CCW_POSITIVE
+    motor_signal = -motor_signal;
+#endif
 
     if (pwm > PWM_MAX) {
         pwm = PWM_MAX;
@@ -321,10 +335,10 @@ static void motor_apply(float control_signal)
         pwm = PWM_MIN;
     }
 
-    if (control_signal > 0.0f) {
+    if (motor_signal > 0.0f) {
         gpio_set_level(PIN_MOTOR_IN1, 1);
         gpio_set_level(PIN_MOTOR_IN2, 0);
-    } else if (control_signal < 0.0f) {
+    } else if (motor_signal < 0.0f) {
         gpio_set_level(PIN_MOTOR_IN1, 0);
         gpio_set_level(PIN_MOTOR_IN2, 1);
     } else {
@@ -1527,13 +1541,17 @@ static void Storage_Task(void *pvParameters)
         control_cmd.value = (float)g_config.profile;
         xQueueSend(ControlQueue, &control_cmd, 0);
 
-        // No mando CMD_SET_ANGLE al inicio para evitar que el motor se mueva solo al reiniciar.
+        control_cmd.type = CMD_SET_ANGLE;
+        control_cmd.value = g_config.setpoint;
+        xQueueSend(ControlQueue, &control_cmd, 0);
+
+        // Al iniciar, vuelve automaticamente al ultimo setpoint guardado.
         // El ángulo queda recuperado como configuración y se puede mostrar en el display.
 
         display_msg_t display_msg;
-        display_msg.type = DISPLAY_SHOW_SETPOINT;
+        display_msg.type = DISPLAY_SHOW_MESSAGE;
         display_msg.value = g_config.setpoint;
-        snprintf(display_msg.text, sizeof(display_msg.text), "Set %.1f", g_config.setpoint);
+        snprintf(display_msg.text, sizeof(display_msg.text), "Auto %.1f", g_config.setpoint);
         xQueueSend(DisplayQueue, &display_msg, 0);
     } else {
         ESP_LOGW(TAG, "No había configuración guardada. Se usan valores por defecto.");
