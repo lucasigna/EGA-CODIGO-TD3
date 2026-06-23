@@ -11,13 +11,16 @@
 
 #include "driver/gpio.h"
 #include "driver/i2c.h"
-#include "driver/ledc.h"
 #include "driver/uart.h"
+
+#include "app_config.h"
+#include "as5600_sensor.h"
+#include "angle_utils.h"
+#include "lcd_display.h"
+#include "motor_driver.h"
 
 #include "esp_log.h"
 #include "esp_err.h"
-#include "esp_check.h"
-#include "hd44780.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 
@@ -26,95 +29,6 @@
 // ============================================================
 
 static const char *TAG = "TD3_PID";
-
-// ============================================================
-// PINES ESP32-S3
-// ============================================================
-
-// L298N
-#define PIN_MOTOR_PWM       GPIO_NUM_4
-#define PIN_MOTOR_IN1       GPIO_NUM_5
-#define PIN_MOTOR_IN2       GPIO_NUM_6
-
-// AS5600
-#define PIN_AS5600_DIR      GPIO_NUM_7
-
-// I2C compartido: AS5600 + LCD
-#define PIN_I2C_SDA         GPIO_NUM_8
-#define PIN_I2C_SCL         GPIO_NUM_9
-
-// Botones
-#define PIN_BTN_PLUS        GPIO_NUM_10
-#define PIN_BTN_MINUS       GPIO_NUM_11
-#define PIN_BTN_MENU        GPIO_NUM_12
-#define PIN_BTN_OK          GPIO_NUM_13
-#define BUTTON_DEBOUNCE_MS  180
-
-// Convencion mecanica: los angulos deben aumentar en sentido antihorario.
-#define ANGLE_CCW_POSITIVE  1
-
-// UART comandos PC
-#define PIN_UART_TX         GPIO_NUM_17
-#define PIN_UART_RX         GPIO_NUM_18
-
-// ============================================================
-// I2C
-// ============================================================
-
-#define I2C_PORT            I2C_NUM_0
-#define I2C_FREQ_HZ         100000
-
-#define AS5600_ADDR         0x36
-#define AS5600_REG_ANGLE_H  0x0E
-
-#define LCD_I2C_ADDR        0x27
-#define LCD_I2C_TIMEOUT_MS  50
-#define LCD_COLS            16
-#define LCD_ROWS            2
-
-// ============================================================
-// PWM LEDC
-// ============================================================
-
-#define LEDC_MODE_USED      LEDC_LOW_SPEED_MODE
-#define LEDC_TIMER_USED     LEDC_TIMER_0
-#define LEDC_CHANNEL_USED   LEDC_CHANNEL_0
-#define LEDC_DUTY_RES       LEDC_TIMER_10_BIT
-#define LEDC_MAX_DUTY       1023
-#define LEDC_FREQ_HZ        20000
-
-// ============================================================
-// UART
-// ============================================================
-
-#define UART_PORT           UART_NUM_1
-#define UART_BUF_SIZE       256
-
-// ============================================================
-// CONTROL
-// ============================================================
-
-#define PID_PERIOD_MS       10
-#define AS5600_PERIOD_MS    10
-
-#define ANGLE_TOLERANCE_DEG 1.0f
-#define ANGLE_ACCEPT_DEG    1.5f
-
-#define PWM_MAX             1023.0f
-#define PWM_MIN             150.0f
-#define PWM_MOVE_MIN        750.0f
-#define PWM_START_BOOST     900.0f
-#define PWM_START_BOOST_MS  300
-#define TARGET_VERIFY_MS    120
-#define FINE_CONTROL_ZONE_DEG 8.0f
-#define FINE_PULSE_MS       25
-#define FINE_BRAKE_MS       180
-
-#define BLOCK_PWM_MIN       250.0f
-#define BLOCK_ERROR_MIN     20.0f
-#define BLOCK_DELTA_MIN     2.0f
-#define BLOCK_START_GRACE_MS 1500
-#define BLOCK_CHECK_PERIOD_MS 1000
 
 // ============================================================
 // TIPOS
@@ -128,6 +42,8 @@ typedef enum {
     PROFILE_SMOOTH = PROFILE_RAMPA
 } movement_profile_t;
 
+// Comandos que cualquier tarea puede enviar al PID por ControlQueue.
+// El PID es la unica tarea que decide finalmente que hacer con el motor.
 typedef enum {
     CMD_SET_ANGLE = 0,
     CMD_SET_KP,
@@ -145,6 +61,8 @@ typedef struct {
     float value;
 } control_cmd_t;
 
+// Solicitudes al bus I2C. La tarea I2C_Manager_Task centraliza el bus para
+// evitar que AS5600 y LCD intenten usar I2C al mismo tiempo.
 typedef enum {
     I2C_REQ_READ_AS5600 = 0,
     I2C_REQ_LCD_INIT,
@@ -162,6 +80,8 @@ typedef struct {
     uint16_t as5600_raw;
 } i2c_response_t;
 
+// Estado resumido del motor que el PID publica para Safety_Task.
+// Safety_Task no maneja el motor directamente: solo observa y avisa al PID.
 typedef struct {
     float setpoint;
     float position;
@@ -171,6 +91,8 @@ typedef struct {
     bool moving;
 } motor_state_t;
 
+// Mensajes logicos para el display. Display_Task traduce estos mensajes a
+// texto de 16x2 y despues pide la escritura fisica por I2C_TXQueue.
 typedef enum {
     DISPLAY_SHOW_MENU = 0,
     DISPLAY_SHOW_SETPOINT,
@@ -187,6 +109,7 @@ typedef struct {
     char text[32];
 } display_msg_t;
 
+// Menus disponibles en la interfaz de botones.
 typedef enum {
     MENU_ANGLE = 0,
     MENU_KP,
@@ -196,6 +119,8 @@ typedef enum {
     MENU_COUNT
 } ui_menu_t;
 
+// Configuracion persistente. Se guarda como un blob completo en NVS para que
+// al reiniciar se recuperen setpoint, constantes PID y perfil.
 typedef struct {
     float setpoint;
     float kp;
@@ -218,6 +143,13 @@ typedef struct {
 // COLAS Y SEMÁFOROS
 // ============================================================
 
+// Las colas separan responsabilidades:
+// ControlQueue lleva comandos hacia PID_Task.
+// I2C_TXQueue/I2C_RXQueue serializan el uso del bus I2C.
+// angleQueue conserva la ultima posicion medida por el AS5600.
+// MotorStateQueue permite que Safety_Task observe el movimiento.
+// DisplayQueue desacopla mensajes de pantalla del driver LCD.
+// ConfigQueue concentra escrituras/lecturas de NVS en Storage_Task.
 static QueueHandle_t ControlQueue;
 static QueueHandle_t I2C_TXQueue;
 static QueueHandle_t I2C_RXQueue;
@@ -231,6 +163,7 @@ static SemaphoreHandle_t sem_btn_minus;
 static SemaphoreHandle_t sem_btn_menu;
 static SemaphoreHandle_t sem_btn_ok;
 
+// Tiempos usados por la ISR para antirrebote por software.
 static volatile TickType_t last_btn_plus_tick;
 static volatile TickType_t last_btn_minus_tick;
 static volatile TickType_t last_btn_menu_tick;
@@ -240,6 +173,7 @@ static volatile TickType_t last_btn_ok_tick;
 // CONFIGURACIÓN GLOBAL
 // ============================================================
 
+// Copia en RAM de la configuracion activa. Storage_Task la sincroniza con NVS.
 static system_config_t g_config = {
     .setpoint = 0.0f,
     .kp = 6.0f,
@@ -254,205 +188,10 @@ static system_config_t g_config = {
 
 static void drain_button_semaphore(SemaphoreHandle_t sem)
 {
+    // Descartar eventos acumulados evita que un rebote viejo se interprete
+    // como una nueva accion de usuario.
     while (xSemaphoreTake(sem, 0) == pdTRUE) {
     }
-}
-
-static float normalize_angle(float angle)
-{
-    while (angle >= 360.0f) {
-        angle -= 360.0f;
-    }
-
-    while (angle < 0.0f) {
-        angle += 360.0f;
-    }
-
-    return angle;
-}
-
-static float calculate_angular_error(float setpoint, float position)
-{
-    float error = setpoint - position;
-
-    while (error > 180.0f) {
-        error -= 360.0f;
-    }
-
-    while (error < -180.0f) {
-        error += 360.0f;
-    }
-
-    return error;
-}
-
-static float raw_to_degrees(uint16_t raw)
-{
-    float angle = ((float)raw * 360.0f) / 4096.0f;
-
-#if ANGLE_CCW_POSITIVE
-    angle = 360.0f - angle;
-#endif
-
-    return normalize_angle(angle);
-}
-
-// ============================================================
-// MOTOR L298N
-// ============================================================
-
-static void motor_stop(void)
-{
-    ledc_set_duty(LEDC_MODE_USED, LEDC_CHANNEL_USED, 0);
-    ledc_update_duty(LEDC_MODE_USED, LEDC_CHANNEL_USED);
-
-    gpio_set_level(PIN_MOTOR_IN1, 0);
-    gpio_set_level(PIN_MOTOR_IN2, 0);
-}
-
-static void motor_brake(void)
-{
-    gpio_set_level(PIN_MOTOR_IN1, 1);
-    gpio_set_level(PIN_MOTOR_IN2, 1);
-
-    ledc_set_duty(LEDC_MODE_USED, LEDC_CHANNEL_USED, LEDC_MAX_DUTY);
-    ledc_update_duty(LEDC_MODE_USED, LEDC_CHANNEL_USED);
-}
-
-static void motor_apply(float control_signal)
-{
-    float pwm = fabsf(control_signal);
-    float motor_signal = control_signal;
-
-#if ANGLE_CCW_POSITIVE
-    motor_signal = -motor_signal;
-#endif
-
-    if (pwm > PWM_MAX) {
-        pwm = PWM_MAX;
-    }
-
-    if (pwm > 0.0f && pwm < PWM_MIN) {
-        pwm = PWM_MIN;
-    }
-
-    if (motor_signal > 0.0f) {
-        gpio_set_level(PIN_MOTOR_IN1, 1);
-        gpio_set_level(PIN_MOTOR_IN2, 0);
-    } else if (motor_signal < 0.0f) {
-        gpio_set_level(PIN_MOTOR_IN1, 0);
-        gpio_set_level(PIN_MOTOR_IN2, 1);
-    } else {
-        motor_stop();
-        return;
-    }
-
-    ledc_set_duty(LEDC_MODE_USED, LEDC_CHANNEL_USED, (uint32_t)pwm);
-    ledc_update_duty(LEDC_MODE_USED, LEDC_CHANNEL_USED);
-}
-
-// ============================================================
-// I2C BAJO NIVEL
-// ============================================================
-
-static esp_err_t as5600_read_raw(uint16_t *raw)
-{
-    uint8_t reg = AS5600_REG_ANGLE_H;
-    uint8_t data[2] = {0};
-
-    esp_err_t err = i2c_master_write_read_device(
-        I2C_PORT,
-        AS5600_ADDR,
-        &reg,
-        1,
-        data,
-        2,
-        pdMS_TO_TICKS(50)
-    );
-
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    *raw = ((uint16_t)data[0] << 8) | data[1];
-    *raw &= 0x0FFF;
-
-    return ESP_OK;
-}
-
-// LCD 16x2 sobre backpack PCF8574.
-// Solo I2C_Manager_Task llama a estas funciones.
-static hd44780_t lcd = {
-    .write_cb = NULL,
-    .font = HD44780_FONT_5X8,
-    .lines = LCD_ROWS,
-    .pins = {
-        .rs = 0,
-        .e = 2,
-        .d4 = 4,
-        .d5 = 5,
-        .d6 = 6,
-        .d7 = 7,
-        .bl = 3,
-    },
-};
-
-static esp_err_t lcd_write_cb(const hd44780_t *lcd_desc, uint8_t data)
-{
-    (void)lcd_desc;
-
-    return i2c_master_write_to_device(
-        I2C_PORT,
-        LCD_I2C_ADDR,
-        &data,
-        1,
-        pdMS_TO_TICKS(LCD_I2C_TIMEOUT_MS)
-    );
-}
-
-static void lcd_format_line(char *dst, const char *src)
-{
-    size_t len = 0;
-
-    memset(dst, ' ', LCD_COLS);
-    dst[LCD_COLS] = '\0';
-
-    while (src[len] != '\0' && len < LCD_COLS) {
-        dst[len] = src[len];
-        len++;
-    }
-}
-
-static esp_err_t lcd_write_line(uint8_t row, const char *text)
-{
-    char line[LCD_COLS + 1];
-
-    lcd_format_line(line, text);
-
-    ESP_RETURN_ON_ERROR(hd44780_gotoxy(&lcd, 0, row), TAG, "LCD gotoxy failed");
-    ESP_RETURN_ON_ERROR(hd44780_puts(&lcd, line), TAG, "LCD puts failed");
-
-    return ESP_OK;
-}
-
-static esp_err_t lcd_write_screen(const char *line1, const char *line2)
-{
-    ESP_RETURN_ON_ERROR(lcd_write_line(0, line1), TAG, "LCD line 1 failed");
-    ESP_RETURN_ON_ERROR(lcd_write_line(1, line2), TAG, "LCD line 2 failed");
-
-    return ESP_OK;
-}
-
-static esp_err_t lcd_init_driver(void)
-{
-    lcd.write_cb = lcd_write_cb;
-
-    ESP_RETURN_ON_ERROR(hd44780_init(&lcd), TAG, "LCD init failed");
-    ESP_RETURN_ON_ERROR(hd44780_switch_backlight(&lcd, true), TAG, "LCD backlight failed");
-    ESP_RETURN_ON_ERROR(hd44780_clear(&lcd), TAG, "LCD clear failed");
-    ESP_RETURN_ON_ERROR(lcd_write_screen("TD3 PID", "Sistema iniciado"), TAG, "LCD splash failed");
-
-    return ESP_OK;
 }
 
 // ============================================================
@@ -461,6 +200,8 @@ static esp_err_t lcd_init_driver(void)
 
 static void save_config_to_nvs(const system_config_t *cfg)
 {
+    // La configuracion se guarda como un unico blob para mantener consistentes
+    // setpoint, Kp, Ki, Kd y perfil.
     nvs_handle_t handle;
 
     esp_err_t err = nvs_open("storage", NVS_READWRITE, &handle);
@@ -491,6 +232,7 @@ static void save_config_to_nvs(const system_config_t *cfg)
 
 static bool load_config_from_nvs(system_config_t *cfg)
 {
+    // Si no existe configuracion valida, el sistema arranca con defaults.
     nvs_handle_t handle;
     size_t required_size = sizeof(system_config_t);
 
@@ -539,6 +281,8 @@ static void IRAM_ATTR gpio_button_isr_handler(void *arg)
 
     if (sem != NULL && last_tick != NULL &&
         (*last_tick == 0 || (now - *last_tick) >= debounce_ticks)) {
+        // La ISR solo avisa el evento con un semaforo. La logica de menu queda
+        // en ButtonHandler_Task, fuera de la interrupcion.
         *last_tick = now;
         xSemaphoreGiveFromISR(sem, &higher_priority_task_woken);
     }
@@ -564,6 +308,8 @@ static void I2C_Manager_Task(void *pvParameters)
 
             switch (req.type) {
                 case I2C_REQ_READ_AS5600:
+                    // Lectura sincronica del sensor. La respuesta vuelve por
+                    // I2C_RXQueue porque solo AS5600_Reader_Task espera raw data.
                     if (as5600_read_raw(&resp.as5600_raw) == ESP_OK) {
                         resp.ok = true;
                     } else {
@@ -575,7 +321,9 @@ static void I2C_Manager_Task(void *pvParameters)
                     break;
 
                 case I2C_REQ_LCD_INIT: {
-                    esp_err_t ret = lcd_init_driver();
+                    // El LCD tambien usa el mismo bus I2C, por eso se inicializa
+                    // desde esta tarea y no desde Display_Task directamente.
+                    esp_err_t ret = lcd_display_init();
 
                     if (ret == ESP_OK) {
                         lcd_ready = true;
@@ -588,7 +336,9 @@ static void I2C_Manager_Task(void *pvParameters)
 
                 case I2C_REQ_LCD_PRINT:
                     if (lcd_ready) {
-                        esp_err_t ret = lcd_write_screen(req.lcd_line1, req.lcd_line2);
+                        // Display_Task ya formateo las lineas. Aca solo se
+                        // ejecuta la operacion fisica sobre el LCD.
+                        esp_err_t ret = lcd_display_write_screen(req.lcd_line1, req.lcd_line2);
 
                         if (ret != ESP_OK) {
                             ESP_LOGE(TAG, "Error escribiendo LCD: %s", esp_err_to_name(ret));
@@ -621,12 +371,14 @@ static void AS5600_Reader_Task(void *pvParameters)
     TickType_t last_log = 0;
 
     while (1) {
+        // No toca I2C directo: pide la lectura al manager para respetar el
+        // arbitraje del bus compartido con el LCD.
         xQueueSend(I2C_TXQueue, &req, portMAX_DELAY);
 
         if (xQueueReceive(I2C_RXQueue, &resp, pdMS_TO_TICKS(100)) == pdTRUE) {
             if (resp.ok) {
-                angle = raw_to_degrees(resp.as5600_raw);
-                angle = normalize_angle(angle);
+                angle = angle_raw_to_degrees(resp.as5600_raw);
+                angle = angle_normalize(angle);
 
                 // Cola de longitud 1: siempre queda la última posición.
                 xQueueOverwrite(angleQueue, &angle);
@@ -685,6 +437,8 @@ static void PID_Task(void *pvParameters)
 
     while (1) {
         if (!moving) {
+            // En reposo el PID no calcula nada: espera comandos. Si se alcanzo
+            // un objetivo, mantiene freno electrico para que el eje no se vaya.
             if (hold_brake) {
                 motor_brake();
             } else {
@@ -696,7 +450,9 @@ static void PID_Task(void *pvParameters)
                     case CMD_SET_ANGLE: {
                         float current_position = 0.0f;
 
-                        setpoint = normalize_angle(cmd.value);
+                        // Nuevo objetivo: se reinician estados dinamicos del PID
+                        // para no arrastrar integral/derivada de otro movimiento.
+                        setpoint = angle_normalize(cmd.value);
                         integral = 0.0f;
                         hold_brake = false;
                         verifying_target = false;
@@ -704,7 +460,7 @@ static void PID_Task(void *pvParameters)
                         fine_pulse_until = 0;
                         fine_brake_until = 0;
                         if (xQueuePeek(angleQueue, &current_position, 0) == pdTRUE) {
-                            previous_error = calculate_angular_error(setpoint, current_position);
+                            previous_error = angle_shortest_error(setpoint, current_position);
                         } else {
                             previous_error = 0.0f;
                         }
@@ -773,10 +529,10 @@ static void PID_Task(void *pvParameters)
                         break;
 
                     case CMD_SET_ANGLE: {
-                        float new_setpoint = normalize_angle(cmd.value);
+                        float new_setpoint = angle_normalize(cmd.value);
                         float current_position = 0.0f;
 
-                        if (fabsf(calculate_angular_error(new_setpoint, setpoint)) < 0.01f) {
+                        if (fabsf(angle_shortest_error(new_setpoint, setpoint)) < 0.01f) {
                             ESP_LOGI(TAG, "Setpoint duplicado ignorado: %.2f", new_setpoint);
                             break;
                         }
@@ -789,7 +545,7 @@ static void PID_Task(void *pvParameters)
                         fine_pulse_until = 0;
                         fine_brake_until = 0;
                         if (xQueuePeek(angleQueue, &current_position, 0) == pdTRUE) {
-                            previous_error = calculate_angular_error(setpoint, current_position);
+                            previous_error = angle_shortest_error(setpoint, current_position);
                         } else {
                             previous_error = 0.0f;
                         }
@@ -815,6 +571,9 @@ static void PID_Task(void *pvParameters)
                         break;
 
                     case CMD_BLOCK_DETECTED:
+                        // Safety_Task detecto que hay PWM y error alto, pero el
+                        // eje casi no cambia. Se fuerza el sentido contrario para
+                        // intentar salir del bloqueo sin apagar el motor.
                         verifying_target = false;
                         force_reverse = true;
                         fine_pulse_until = 0;
@@ -854,9 +613,11 @@ static void PID_Task(void *pvParameters)
                 continue;
             }
 
-            error = calculate_angular_error(setpoint, position);
+            error = angle_shortest_error(setpoint, position);
 
             if (force_reverse) {
+                // Normalmente se usa el camino angular mas corto. Ante bloqueo
+                // se invierte el sentido para intentar liberar la mecanica.
                 if (error > 0.0f) {
                     error -= 360.0f;
                 } else {
@@ -867,6 +628,9 @@ static void PID_Task(void *pvParameters)
             if (verifying_target) {
                 TickType_t now = xTaskGetTickCount();
 
+                // Al entrar en tolerancia se frena y se espera un tiempo corto.
+                // Asi no se declara "objetivo alcanzado" por una lectura aislada
+                // mientras el eje todavia viene con inercia.
                 motor_brake();
                 output = 0.0f;
                 integral = 0.0f;
@@ -909,7 +673,8 @@ static void PID_Task(void *pvParameters)
 
             integral += error * dt;
 
-            // Antiwindup simple
+            // Antiwindup simple: limita la integral para que no siga acumulando
+            // error cuando el actuador ya esta saturado.
             if (integral > 100.0f) {
                 integral = 100.0f;
             }
@@ -922,7 +687,7 @@ static void PID_Task(void *pvParameters)
 
             output = kp * error + ki * integral + kd * derivative;
 
-            // Perfil RAMPA: reduce la salida del controlador.
+            // Perfil RAMPA: misma consigna, pero con salida suavizada.
             if (profile == PROFILE_RAMPA) {
                 output *= 0.6f;
             }
@@ -930,6 +695,8 @@ static void PID_Task(void *pvParameters)
             if (fabsf(error) <= ANGLE_TOLERANCE_DEG) {
                 TickType_t now = xTaskGetTickCount();
 
+                // Primera entrada al rango fino. Se congela el control y se
+                // verifica estabilidad antes de avisar por display.
                 motor_brake();
                 integral = 0.0f;
                 previous_error = error;
@@ -946,6 +713,9 @@ static void PID_Task(void *pvParameters)
                 TickType_t control_now = xTaskGetTickCount();
 
                 if (fabsf(error) <= FINE_CONTROL_ZONE_DEG) {
+                    // Cerca del objetivo el motor necesita un minimo de PWM para
+                    // vencer rozamiento, pero si queda aplicado oscila. Por eso
+                    // se usan pulsos cortos separados por freno.
                     if (fine_brake_until != 0 &&
                         (int32_t)(control_now - fine_brake_until) < 0) {
                         output = 0.0f;
@@ -968,6 +738,8 @@ static void PID_Task(void *pvParameters)
                         }
                     }
                 } else {
+                    // Lejos del objetivo se usa control continuo con boost
+                    // inicial para vencer inercia/rozamiento de arranque.
                     fine_pulse_until = 0;
                     fine_brake_until = 0;
 
@@ -1019,6 +791,9 @@ static void PID_Task(void *pvParameters)
 
 static void Safety_Task(void *pvParameters)
 {
+    // Supervisa el movimiento publicado por PID_Task. Si el motor recibe PWM,
+    // sigue lejos del setpoint y la posicion casi no cambia, informa bloqueo.
+    // No actua sobre el driver del motor: manda CMD_BLOCK_DETECTED al PID.
     motor_state_t state;
     float reference_position = 0.0f;
     bool was_moving = false;
@@ -1035,6 +810,8 @@ static void Safety_Task(void *pvParameters)
             }
 
             if (!was_moving) {
+                // Se da una ventana inicial para que el motor venza la inercia
+                // antes de evaluar bloqueo.
                 was_moving = true;
                 movement_start_tick = now;
                 last_check_tick = now;
@@ -1057,6 +834,7 @@ static void Safety_Task(void *pvParameters)
                 state.pwm > BLOCK_PWM_MIN &&
                 fabsf(state.error) > BLOCK_ERROR_MIN &&
                 delta < BLOCK_DELTA_MIN) {
+                // El PID interpreta este comando invirtiendo el sentido de giro.
                 control_cmd_t cmd = {
                     .type = CMD_BLOCK_DETECTED,
                     .value = 0.0f
@@ -1083,6 +861,8 @@ static void Safety_Task(void *pvParameters)
 
 static void UART_Command_Task(void *pvParameters)
 {
+    // Interfaz de diagnostico/configuracion por consola serie.
+    // Cada comando se transforma en mensajes hacia PID, Storage y/o Display.
     uint8_t data[UART_BUF_SIZE];
 
     while (1) {
@@ -1100,7 +880,7 @@ static void UART_Command_Task(void *pvParameters)
             float value;
 
             if (sscanf((char *)data, "SET ANGLE %f", &value) == 1) {
-                value = normalize_angle(value);
+                value = angle_normalize(value);
 
                 // UART -> PID
                 control_cmd.type = CMD_SET_ANGLE;
@@ -1236,6 +1016,9 @@ static void UART_Command_Task(void *pvParameters)
 
 static void ButtonHandler_Task(void *pvParameters)
 {
+    // Interfaz local de cinco menus:
+    // ANGULO se edita con +/- y se ejecuta con OK.
+    // Kp/Ki/Kd/PERFIL se aplican y guardan al cambiar con +/-.
     ui_menu_t menu = MENU_ANGLE;
     float selected_angle = g_config.setpoint;
     float selected_kp = g_config.kp;
@@ -1256,6 +1039,7 @@ static void ButtonHandler_Task(void *pvParameters)
 
     while (1) {
         if (xSemaphoreTake(sem_btn_menu, 0) == pdTRUE) {
+            // MENU solo cambia la pantalla activa; no mueve el motor.
             menu = (ui_menu_t)((menu + 1) % MENU_COUNT);
 
             switch (menu) {
@@ -1306,10 +1090,12 @@ static void ButtonHandler_Task(void *pvParameters)
         if (plus_pressed == pdTRUE || minus_pressed == pdTRUE) {
             int direction = plus_pressed == pdTRUE ? 1 : -1;
 
+            // En ANGULO solo se prepara el nuevo valor. En los otros menus el
+            // cambio se aplica inmediatamente al PID y se guarda en NVS.
             switch (menu) {
                 case MENU_ANGLE:
                     selected_angle += 5.0f * direction;
-                    selected_angle = normalize_angle(selected_angle);
+                    selected_angle = angle_normalize(selected_angle);
                     display_msg.type = DISPLAY_SHOW_SETPOINT;
                     display_msg.value = selected_angle;
                     snprintf(display_msg.text, sizeof(display_msg.text), "OK mueve");
@@ -1391,6 +1177,7 @@ static void ButtonHandler_Task(void *pvParameters)
 
         if (xSemaphoreTake(sem_btn_ok, 0) == pdTRUE) {
             if (menu == MENU_ANGLE) {
+                // OK en ANGULO es la unica accion de boton que inicia movimiento.
                 control_cmd.type = CMD_SET_PROFILE;
                 control_cmd.value = (float)selected_profile;
                 xQueueSend(ControlQueue, &control_cmd, portMAX_DELAY);
@@ -1461,6 +1248,8 @@ static void ButtonHandler_Task(void *pvParameters)
 
 static void Display_Task(void *pvParameters)
 {
+    // Display_Task recibe mensajes logicos y los convierte en dos lineas de LCD.
+    // La escritura fisica se delega al I2C_Manager_Task para no competir por I2C.
     display_msg_t msg;
     i2c_request_t req;
 
@@ -1533,6 +1322,8 @@ static void Display_Task(void *pvParameters)
 
 static void Storage_Task(void *pvParameters)
 {
+    // Unica tarea que escribe/lee NVS. Asi se evita que varias tareas accedan a
+    // memoria no volatil al mismo tiempo.
     system_config_t cfg;
     config_msg_t msg;
 
@@ -1678,27 +1469,7 @@ static void init_i2c(void)
 
 static void init_pwm(void)
 {
-    ledc_timer_config_t ledc_timer = {
-        .speed_mode = LEDC_MODE_USED,
-        .timer_num = LEDC_TIMER_USED,
-        .duty_resolution = LEDC_DUTY_RES,
-        .freq_hz = LEDC_FREQ_HZ,
-        .clk_cfg = LEDC_AUTO_CLK
-    };
-
-    ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
-
-    ledc_channel_config_t ledc_channel = {
-        .speed_mode = LEDC_MODE_USED,
-        .channel = LEDC_CHANNEL_USED,
-        .timer_sel = LEDC_TIMER_USED,
-        .intr_type = LEDC_INTR_DISABLE,
-        .gpio_num = PIN_MOTOR_PWM,
-        .duty = 0,
-        .hpoint = 0
-    };
-
-    ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
+    ESP_ERROR_CHECK(motor_driver_init_pwm());
 }
 
 // ============================================================
@@ -1756,6 +1527,13 @@ void app_main(void)
     init_pwm();
     init_uart();
 
+    // Mapa de comunicacion entre tareas:
+    // ControlQueue: UI/UART/Storage/Safety -> PID_Task.
+    // angleQueue: AS5600_Reader_Task -> PID_Task.
+    // MotorStateQueue: PID_Task -> Safety_Task.
+    // DisplayQueue: UI/UART/PID/Storage -> Display_Task.
+    // ConfigQueue: UI/UART -> Storage_Task.
+    // I2C_TXQueue/I2C_RXQueue: AS5600/LCD tasks -> I2C_Manager_Task.
     ControlQueue = xQueueCreate(10, sizeof(control_cmd_t));
     I2C_TXQueue = xQueueCreate(10, sizeof(i2c_request_t));
     I2C_RXQueue = xQueueCreate(10, sizeof(i2c_response_t));
