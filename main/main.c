@@ -98,6 +98,7 @@ static const char *TAG = "TD3_PID";
 #define AS5600_PERIOD_MS    10
 
 #define ANGLE_TOLERANCE_DEG 1.0f
+#define ANGLE_ACCEPT_DEG    1.5f
 
 #define PWM_MAX             1023.0f
 #define PWM_MIN             150.0f
@@ -680,6 +681,7 @@ static void PID_Task(void *pvParameters)
     bool moving = false;
     bool hold_brake = false;
     bool verifying_target = false;
+    bool force_reverse = false;
 
     while (1) {
         if (!moving) {
@@ -698,6 +700,7 @@ static void PID_Task(void *pvParameters)
                         integral = 0.0f;
                         hold_brake = false;
                         verifying_target = false;
+                        force_reverse = false;
                         fine_pulse_until = 0;
                         fine_brake_until = 0;
                         if (xQueuePeek(angleQueue, &current_position, 0) == pdTRUE) {
@@ -745,6 +748,7 @@ static void PID_Task(void *pvParameters)
                         moving = false;
                         hold_brake = false;
                         verifying_target = false;
+                        force_reverse = false;
                         fine_pulse_until = 0;
                         fine_brake_until = 0;
                         break;
@@ -761,6 +765,7 @@ static void PID_Task(void *pvParameters)
                         moving = false;
                         hold_brake = false;
                         verifying_target = false;
+                        force_reverse = false;
                         fine_pulse_until = 0;
                         fine_brake_until = 0;
                         motor_stop();
@@ -780,6 +785,7 @@ static void PID_Task(void *pvParameters)
                         integral = 0.0f;
                         hold_brake = false;
                         verifying_target = false;
+                        force_reverse = false;
                         fine_pulse_until = 0;
                         fine_brake_until = 0;
                         if (xQueuePeek(angleQueue, &current_position, 0) == pdTRUE) {
@@ -809,7 +815,14 @@ static void PID_Task(void *pvParameters)
                         break;
 
                     case CMD_BLOCK_DETECTED:
-                        ESP_LOGW(TAG, "Bloqueo detectado ignorado. Motor sigue activo.");
+                        verifying_target = false;
+                        force_reverse = true;
+                        fine_pulse_until = 0;
+                        fine_brake_until = 0;
+                        integral = 0.0f;
+                        previous_error = 0.0f;
+                        start_boost_until = xTaskGetTickCount() + pdMS_TO_TICKS(PWM_START_BOOST_MS);
+                        ESP_LOGW(TAG, "Bloqueo detectado. Cambiando sentido de giro.");
                         break;
 
                     case CMD_REVERSE:
@@ -843,6 +856,14 @@ static void PID_Task(void *pvParameters)
 
             error = calculate_angular_error(setpoint, position);
 
+            if (force_reverse) {
+                if (error > 0.0f) {
+                    error -= 360.0f;
+                } else {
+                    error += 360.0f;
+                }
+            }
+
             if (verifying_target) {
                 TickType_t now = xTaskGetTickCount();
 
@@ -852,12 +873,13 @@ static void PID_Task(void *pvParameters)
                 previous_error = error;
 
                 if ((int32_t)(now - target_verify_until) >= 0) {
-                    if (fabsf(error) <= ANGLE_TOLERANCE_DEG) {
+                    if (fabsf(error) <= ANGLE_ACCEPT_DEG) {
                         display_msg_t display_msg;
 
                         moving = false;
                         hold_brake = true;
                         verifying_target = false;
+                        force_reverse = false;
 
                         ESP_LOGI(TAG, "Objetivo alcanzado. Posicion: %.2f", position);
                         display_msg.type = DISPLAY_SHOW_MESSAGE;
@@ -1035,10 +1057,18 @@ static void Safety_Task(void *pvParameters)
                 state.pwm > BLOCK_PWM_MIN &&
                 fabsf(state.error) > BLOCK_ERROR_MIN &&
                 delta < BLOCK_DELTA_MIN) {
-                ESP_LOGW(TAG, "Safety_Task: posible bloqueo detectado sin detener motor, delta=%.2f err=%.2f pwm=%.1f",
+                control_cmd_t cmd = {
+                    .type = CMD_BLOCK_DETECTED,
+                    .value = 0.0f
+                };
+
+                xQueueSend(ControlQueue, &cmd, 0);
+
+                ESP_LOGW(TAG, "Safety_Task: bloqueo detectado, delta=%.2f err=%.2f pwm=%.1f",
                          delta,
                          state.error,
                          state.pwm);
+                was_moving = false;
             }
 
             reference_position = state.position;
