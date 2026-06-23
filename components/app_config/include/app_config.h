@@ -65,10 +65,11 @@
 #define ANGLE_ACCEPT_DEG    1.5f
 
 // El motor necesita un PWM alto para empezar a moverse. Cerca del objetivo se
-// aplican pulsos cortos de PWM_MOVE_MIN y luego freno para evitar oscilaciones.
+// usan pulsos mas suaves para no pasarse por inercia.
 #define PWM_MAX             1023.0f
 #define PWM_MIN             150.0f
 #define PWM_MOVE_MIN        750.0f
+#define PWM_FINE_MIN        700.0f
 #define PWM_START_BOOST     900.0f
 #define PWM_START_BOOST_MS  300
 #define TARGET_VERIFY_MS    120

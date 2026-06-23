@@ -36,10 +36,7 @@ static const char *TAG = "TD3_PID";
 
 typedef enum {
     PROFILE_ESCALON = 0,
-    PROFILE_RAMPA,
-
-    PROFILE_FAST = PROFILE_ESCALON,
-    PROFILE_SMOOTH = PROFILE_RAMPA
+    PROFILE_RAMPA
 } movement_profile_t;
 
 // Comandos que cualquier tarea puede enviar al PID por ControlQueue.
@@ -713,9 +710,9 @@ static void PID_Task(void *pvParameters)
                 TickType_t control_now = xTaskGetTickCount();
 
                 if (fabsf(error) <= FINE_CONTROL_ZONE_DEG) {
-                    // Cerca del objetivo el motor necesita un minimo de PWM para
-                    // vencer rozamiento, pero si queda aplicado oscila. Por eso
-                    // se usan pulsos cortos separados por freno.
+                    // Cerca del objetivo se usa un PWM menor que el de movimiento
+                    // normal. Con mas tension de alimentacion, el mismo duty
+                    // genera un empujon mas fuerte.
                     if (fine_brake_until != 0 &&
                         (int32_t)(control_now - fine_brake_until) < 0) {
                         output = 0.0f;
@@ -728,7 +725,7 @@ static void PID_Task(void *pvParameters)
                         }
 
                         if ((int32_t)(control_now - fine_pulse_until) < 0) {
-                            output = (error >= 0.0f) ? PWM_MOVE_MIN : -PWM_MOVE_MIN;
+                            output = (error >= 0.0f) ? PWM_FINE_MIN : -PWM_FINE_MIN;
                             motor_apply(output);
                         } else {
                             fine_pulse_until = 0;
@@ -945,8 +942,7 @@ static void UART_Command_Task(void *pvParameters)
                 xQueueSend(DisplayQueue, &display_msg, 0);
             }
 
-            else if (strstr((char *)data, "SET PROFILE ESCALON") != NULL ||
-                     strstr((char *)data, "SET PROFILE FAST") != NULL) {
+            else if (strstr((char *)data, "SET PROFILE ESCALON") != NULL) {
                 control_cmd.type = CMD_SET_PROFILE;
                 control_cmd.value = PROFILE_ESCALON;
                 xQueueSend(ControlQueue, &control_cmd, portMAX_DELAY);
@@ -962,8 +958,7 @@ static void UART_Command_Task(void *pvParameters)
                 xQueueSend(DisplayQueue, &display_msg, 0);
             }
 
-            else if (strstr((char *)data, "SET PROFILE RAMPA") != NULL ||
-                     strstr((char *)data, "SET PROFILE SMOOTH") != NULL) {
+            else if (strstr((char *)data, "SET PROFILE RAMPA") != NULL) {
                 control_cmd.type = CMD_SET_PROFILE;
                 control_cmd.value = PROFILE_RAMPA;
                 xQueueSend(ControlQueue, &control_cmd, portMAX_DELAY);
