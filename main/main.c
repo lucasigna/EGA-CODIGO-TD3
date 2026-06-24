@@ -175,7 +175,7 @@ static system_config_t g_config = {
     .setpoint = 0.0f,
     .kp = 6.0f,
     .ki = 0.0f,
-    .kd = 0.25f,
+    .kd = 0.5f,
     .profile = PROFILE_ESCALON
 };
 
