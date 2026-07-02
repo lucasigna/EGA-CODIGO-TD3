@@ -23,11 +23,16 @@
 #define PIN_BTN_MENU        GPIO_NUM_12
 #define PIN_BTN_OK          GPIO_NUM_13
 #define BUTTON_DEBOUNCE_MS  180
+#define BUTTON_HOLD_START_MS 400
+#define BUTTON_HOLD_REPEAT_MS 120
 
 // Convencion mecanica: los angulos deben aumentar en sentido antihorario.
 #define ANGLE_CCW_POSITIVE  1
 
 // UART comandos PC
+// UART_USE_CONSOLE=1 permite mandar comandos desde el mismo monitor USB usado
+// para flashear. Si se pone en 0, se usa UART_PORT por los pines TX/RX.
+#define UART_USE_CONSOLE    1
 #define PIN_UART_TX         GPIO_NUM_17
 #define PIN_UART_RX         GPIO_NUM_18
 
@@ -37,6 +42,7 @@
 
 #define AS5600_ADDR         0x36
 #define AS5600_REG_ANGLE_H  0x0E
+#define AS5600_LOG_ENABLE   0
 
 #define LCD_I2C_ADDR        0x27
 #define LCD_I2C_TIMEOUT_MS  50
@@ -61,8 +67,8 @@
 #define PID_PERIOD_MS       10
 #define AS5600_PERIOD_MS    10
 
-#define ANGLE_TOLERANCE_DEG 1.0f
-#define ANGLE_ACCEPT_DEG    1.5f
+#define ANGLE_TOLERANCE_DEG 0.7f
+#define ANGLE_ACCEPT_DEG    0.5f
 
 // El motor necesita un PWM alto para empezar a moverse. Cerca del objetivo se
 // usan pulsos mas suaves para no pasarse por inercia.
@@ -72,10 +78,10 @@
 #define PWM_FINE_MIN        700.0f
 #define PWM_START_BOOST     900.0f
 #define PWM_START_BOOST_MS  300
-#define TARGET_VERIFY_MS    120
-#define FINE_CONTROL_ZONE_DEG 8.0f
-#define FINE_PULSE_MS       25
-#define FINE_BRAKE_MS       180
+#define TARGET_VERIFY_MS    60
+#define FINE_CONTROL_ZONE_DEG 2.0f
+#define FINE_PULSE_MS       20
+#define FINE_BRAKE_MS       120
 
 // Criterios de bloqueo: si hay PWM suficiente, error grande y la posicion casi
 // no cambia durante la ventana de chequeo, Safety_Task avisa al PID.

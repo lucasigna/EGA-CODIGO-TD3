@@ -191,6 +191,21 @@ static void drain_button_semaphore(SemaphoreHandle_t sem)
     }
 }
 
+
+static float step_angle_by_5(float angle, int direction)
+{
+    float normalized = angle_normalize(angle);
+    float stepped;
+
+    if (direction > 0) {
+        stepped = floorf(normalized / 5.0f) * 5.0f + 5.0f;
+    } else {
+        stepped = ceilf(normalized / 5.0f) * 5.0f - 5.0f;
+    }
+
+    return angle_normalize(stepped);
+}
+
 // ============================================================
 // NVS
 // ============================================================
@@ -365,7 +380,9 @@ static void AS5600_Reader_Task(void *pvParameters)
 
     i2c_response_t resp;
     float angle = 0.0f;
+#if AS5600_LOG_ENABLE
     TickType_t last_log = 0;
+#endif
 
     while (1) {
         // No toca I2C directo: pide la lectura al manager para respetar el
@@ -380,12 +397,14 @@ static void AS5600_Reader_Task(void *pvParameters)
                 // Cola de longitud 1: siempre queda la última posición.
                 xQueueOverwrite(angleQueue, &angle);
 
+#if AS5600_LOG_ENABLE
                 TickType_t now = xTaskGetTickCount();
 
                 if ((now - last_log) >= pdMS_TO_TICKS(500)) {
                     ESP_LOGI(TAG, "AS5600 raw=%u angle=%.2f deg", (unsigned)resp.as5600_raw, angle);
                     last_log = now;
                 }
+#endif
             } else {
                 ESP_LOGW(TAG, "Fallo lectura AS5600");
             }
@@ -689,10 +708,10 @@ static void PID_Task(void *pvParameters)
                 output *= 0.6f;
             }
 
-            if (fabsf(error) <= ANGLE_TOLERANCE_DEG) {
+            if (fabsf(error) <= ANGLE_ACCEPT_DEG) {
                 TickType_t now = xTaskGetTickCount();
 
-                // Primera entrada al rango fino. Se congela el control y se
+                // Primera entrada al rango aceptado. Se congela el control y se
                 // verifica estabilidad antes de avisar por display.
                 motor_brake();
                 integral = 0.0f;
@@ -863,11 +882,52 @@ static void UART_Command_Task(void *pvParameters)
     uint8_t data[UART_BUF_SIZE];
 
     while (1) {
+#if UART_USE_CONSOLE
+        int len = 0;
+
+        printf("\r\nCMD> ");
+        fflush(stdout);
+
+        while (1) {
+            int ch = getchar();
+
+            if (ch < 0) {
+                vTaskDelay(pdMS_TO_TICKS(20));
+                continue;
+            }
+
+            if (ch == '\r' || ch == '\n') {
+                data[len] = '\0';
+                printf("\r\n");
+                fflush(stdout);
+                break;
+            }
+
+            if (ch == '\b' || ch == 0x7F) {
+                if (len > 0) {
+                    len--;
+                    printf("\b \b");
+                    fflush(stdout);
+                }
+                continue;
+            }
+
+            if (len < (UART_BUF_SIZE - 1) && ch >= 32 && ch <= 126) {
+                data[len] = (uint8_t)ch;
+                len++;
+                putchar(ch);
+                fflush(stdout);
+            }
+        }
+#else
         int len = uart_read_bytes(UART_PORT, data, UART_BUF_SIZE - 1, portMAX_DELAY);
 
         if (len > 0) {
             data[len] = '\0';
+        }
+#endif
 
+        if (len > 0) {
             ESP_LOGI(TAG, "UART RX: %s", (char *)data);
 
             control_cmd_t control_cmd;
@@ -875,29 +935,39 @@ static void UART_Command_Task(void *pvParameters)
             display_msg_t display_msg;
 
             float value;
+            bool command_ok = false;
 
             if (sscanf((char *)data, "SET ANGLE %f", &value) == 1) {
-                value = angle_normalize(value);
+                if (value >= 0.0f && value <= 360.0f) {
+                    command_ok = true;
+                    value = angle_normalize(value);
 
-                // UART -> PID
-                control_cmd.type = CMD_SET_ANGLE;
-                control_cmd.value = value;
-                xQueueSend(ControlQueue, &control_cmd, portMAX_DELAY);
+                    // UART -> PID
+                    control_cmd.type = CMD_SET_ANGLE;
+                    control_cmd.value = value;
+                    xQueueSend(ControlQueue, &control_cmd, portMAX_DELAY);
 
-                // UART -> Storage
-                g_config.setpoint = value;
-                config_msg.type = CONFIG_SAVE_ALL;
-                config_msg.config = g_config;
-                xQueueSend(ConfigQueue, &config_msg, portMAX_DELAY);
+                    // UART -> Storage
+                    g_config.setpoint = value;
+                    config_msg.type = CONFIG_SAVE_ALL;
+                    config_msg.config = g_config;
+                    xQueueSend(ConfigQueue, &config_msg, portMAX_DELAY);
 
-                // UART -> Display
-                display_msg.type = DISPLAY_SHOW_SETPOINT;
-                display_msg.value = value;
-                snprintf(display_msg.text, sizeof(display_msg.text), "Angle %.1f", value);
-                xQueueSend(DisplayQueue, &display_msg, 0);
+                    // UART -> Display
+                    display_msg.type = DISPLAY_SHOW_SETPOINT;
+                    display_msg.value = value;
+                    snprintf(display_msg.text, sizeof(display_msg.text), "Angle %.1f", value);
+                    xQueueSend(DisplayQueue, &display_msg, 0);
+                } else {
+                    display_msg.type = DISPLAY_SHOW_MESSAGE;
+                    snprintf(display_msg.text, sizeof(display_msg.text), "Angle invalido");
+                    xQueueSend(DisplayQueue, &display_msg, 0);
+                }
             }
 
+
             else if (sscanf((char *)data, "SET KP %f", &value) == 1) {
+                command_ok = true;
                 control_cmd.type = CMD_SET_KP;
                 control_cmd.value = value;
                 xQueueSend(ControlQueue, &control_cmd, portMAX_DELAY);
@@ -913,6 +983,7 @@ static void UART_Command_Task(void *pvParameters)
             }
 
             else if (sscanf((char *)data, "SET KI %f", &value) == 1) {
+                command_ok = true;
                 control_cmd.type = CMD_SET_KI;
                 control_cmd.value = value;
                 xQueueSend(ControlQueue, &control_cmd, portMAX_DELAY);
@@ -928,6 +999,7 @@ static void UART_Command_Task(void *pvParameters)
             }
 
             else if (sscanf((char *)data, "SET KD %f", &value) == 1) {
+                command_ok = true;
                 control_cmd.type = CMD_SET_KD;
                 control_cmd.value = value;
                 xQueueSend(ControlQueue, &control_cmd, portMAX_DELAY);
@@ -943,6 +1015,7 @@ static void UART_Command_Task(void *pvParameters)
             }
 
             else if (strstr((char *)data, "SET PROFILE ESCALON") != NULL) {
+                command_ok = true;
                 control_cmd.type = CMD_SET_PROFILE;
                 control_cmd.value = PROFILE_ESCALON;
                 xQueueSend(ControlQueue, &control_cmd, portMAX_DELAY);
@@ -959,6 +1032,7 @@ static void UART_Command_Task(void *pvParameters)
             }
 
             else if (strstr((char *)data, "SET PROFILE RAMPA") != NULL) {
+                command_ok = true;
                 control_cmd.type = CMD_SET_PROFILE;
                 control_cmd.value = PROFILE_RAMPA;
                 xQueueSend(ControlQueue, &control_cmd, portMAX_DELAY);
@@ -974,25 +1048,6 @@ static void UART_Command_Task(void *pvParameters)
                 xQueueSend(DisplayQueue, &display_msg, 0);
             }
 
-            else if (strstr((char *)data, "SAVE") != NULL) {
-                config_msg.type = CONFIG_SAVE_ALL;
-                config_msg.config = g_config;
-                xQueueSend(ConfigQueue, &config_msg, portMAX_DELAY);
-
-                display_msg.type = DISPLAY_SHOW_MESSAGE;
-                snprintf(display_msg.text, sizeof(display_msg.text), "Config saved");
-                xQueueSend(DisplayQueue, &display_msg, 0);
-            }
-
-            else if (strstr((char *)data, "STOP") != NULL) {
-                control_cmd.type = CMD_STOP;
-                control_cmd.value = 0.0f;
-                xQueueSend(ControlQueue, &control_cmd, portMAX_DELAY);
-
-                display_msg.type = DISPLAY_SHOW_MESSAGE;
-                snprintf(display_msg.text, sizeof(display_msg.text), "STOP");
-                xQueueSend(DisplayQueue, &display_msg, 0);
-            }
 
             else {
                 display_msg.type = DISPLAY_SHOW_MESSAGE;
@@ -1001,6 +1056,9 @@ static void UART_Command_Task(void *pvParameters)
 
                 ESP_LOGW(TAG, "Comando UART no reconocido");
             }
+
+            printf("%s\r\n", command_ok ? "OK" : "ERROR");
+            fflush(stdout);
         }
     }
 }
@@ -1024,6 +1082,8 @@ static void ButtonHandler_Task(void *pvParameters)
     display_msg_t display_msg;
     control_cmd_t control_cmd;
     config_msg_t config_msg;
+    TickType_t next_plus_repeat_tick = 0;
+    TickType_t next_minus_repeat_tick = 0;
 
     (void)pvParameters;
 
@@ -1036,6 +1096,8 @@ static void ButtonHandler_Task(void *pvParameters)
         if (xSemaphoreTake(sem_btn_menu, 0) == pdTRUE) {
             // MENU solo cambia la pantalla activa; no mueve el motor.
             menu = (ui_menu_t)((menu + 1) % MENU_COUNT);
+            next_plus_repeat_tick = 0;
+            next_minus_repeat_tick = 0;
 
             switch (menu) {
                 case MENU_ANGLE:
@@ -1079,8 +1141,35 @@ static void ButtonHandler_Task(void *pvParameters)
             continue;
         }
 
-        BaseType_t plus_pressed = xSemaphoreTake(sem_btn_plus, 0);
-        BaseType_t minus_pressed = xSemaphoreTake(sem_btn_minus, 0);
+        TickType_t now = xTaskGetTickCount();
+        bool plus_is_down = gpio_get_level(PIN_BTN_PLUS) == 1;
+        bool minus_is_down = gpio_get_level(PIN_BTN_MINUS) == 1;
+        BaseType_t plus_edge = xSemaphoreTake(sem_btn_plus, 0);
+        BaseType_t minus_edge = xSemaphoreTake(sem_btn_minus, 0);
+        BaseType_t plus_pressed = pdFALSE;
+        BaseType_t minus_pressed = pdFALSE;
+
+        if (plus_edge == pdTRUE) {
+            plus_pressed = pdTRUE;
+            next_plus_repeat_tick = now + pdMS_TO_TICKS(BUTTON_HOLD_START_MS);
+        } else if (plus_is_down && next_plus_repeat_tick != 0 &&
+                   (int32_t)(now - next_plus_repeat_tick) >= 0) {
+            plus_pressed = pdTRUE;
+            next_plus_repeat_tick = now + pdMS_TO_TICKS(BUTTON_HOLD_REPEAT_MS);
+        } else if (!plus_is_down) {
+            next_plus_repeat_tick = 0;
+        }
+
+        if (minus_edge == pdTRUE) {
+            minus_pressed = pdTRUE;
+            next_minus_repeat_tick = now + pdMS_TO_TICKS(BUTTON_HOLD_START_MS);
+        } else if (minus_is_down && next_minus_repeat_tick != 0 &&
+                   (int32_t)(now - next_minus_repeat_tick) >= 0) {
+            minus_pressed = pdTRUE;
+            next_minus_repeat_tick = now + pdMS_TO_TICKS(BUTTON_HOLD_REPEAT_MS);
+        } else if (!minus_is_down) {
+            next_minus_repeat_tick = 0;
+        }
 
         if (plus_pressed == pdTRUE || minus_pressed == pdTRUE) {
             int direction = plus_pressed == pdTRUE ? 1 : -1;
@@ -1089,8 +1178,7 @@ static void ButtonHandler_Task(void *pvParameters)
             // cambio se aplica inmediatamente al PID y se guarda en NVS.
             switch (menu) {
                 case MENU_ANGLE:
-                    selected_angle += 5.0f * direction;
-                    selected_angle = angle_normalize(selected_angle);
+                    selected_angle = step_angle_by_5(selected_angle, direction);
                     display_msg.type = DISPLAY_SHOW_SETPOINT;
                     display_msg.value = selected_angle;
                     snprintf(display_msg.text, sizeof(display_msg.text), "OK mueve");
@@ -1171,6 +1259,9 @@ static void ButtonHandler_Task(void *pvParameters)
         }
 
         if (xSemaphoreTake(sem_btn_ok, 0) == pdTRUE) {
+            next_plus_repeat_tick = 0;
+            next_minus_repeat_tick = 0;
+
             if (menu == MENU_ANGLE) {
                 // OK en ANGULO es la unica accion de boton que inicia movimiento.
                 control_cmd.type = CMD_SET_PROFILE;
@@ -1473,6 +1564,10 @@ static void init_pwm(void)
 
 static void init_uart(void)
 {
+#if UART_USE_CONSOLE
+    setvbuf(stdin, NULL, _IONBF, 0);
+    ESP_LOGI(TAG, "Comandos UART por consola USB");
+#else
     uart_config_t uart_config = {
         .baud_rate = 115200,
         .data_bits = UART_DATA_8_BITS,
@@ -1485,6 +1580,7 @@ static void init_uart(void)
     ESP_ERROR_CHECK(uart_driver_install(UART_PORT, UART_BUF_SIZE * 2, 0, 0, NULL, 0));
     ESP_ERROR_CHECK(uart_param_config(UART_PORT, &uart_config));
     ESP_ERROR_CHECK(uart_set_pin(UART_PORT, PIN_UART_TX, PIN_UART_RX, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+#endif
 }
 
 // ============================================================
