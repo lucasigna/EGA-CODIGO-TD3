@@ -32,7 +32,7 @@
 // UART comandos PC
 // UART_USE_CONSOLE=1 permite mandar comandos desde el mismo monitor USB usado
 // para flashear. Si se pone en 0, se usa UART_PORT por los pines TX/RX.
-#define UART_USE_CONSOLE    1
+#define UART_USE_CONSOLE    0
 #define PIN_UART_TX         GPIO_NUM_17
 #define PIN_UART_RX         GPIO_NUM_18
 
@@ -83,10 +83,12 @@
 #define FINE_PULSE_MS       20
 #define FINE_BRAKE_MS       120
 
-// Criterios de bloqueo: si hay PWM suficiente, error grande y la posicion casi
-// no cambia durante la ventana de chequeo, Safety_Task avisa al PID.
+// Criterios de bloqueo: exige PWM sostenido, error grande y poco cambio de
+// posicion durante varios chequeos consecutivos.
 #define BLOCK_PWM_MIN       250.0f
-#define BLOCK_ERROR_MIN     20.0f
-#define BLOCK_DELTA_MIN     2.0f
-#define BLOCK_START_GRACE_MS 1500
-#define BLOCK_CHECK_PERIOD_MS 1000
+#define BLOCK_ERROR_MIN     8.0f
+#define BLOCK_DELTA_MIN     5.0f
+#define BLOCK_CONSECUTIVE_LIMIT 2
+#define BLOCK_COOLDOWN_MS   500
+#define BLOCK_START_GRACE_MS 500
+#define BLOCK_CHECK_PERIOD_MS 250

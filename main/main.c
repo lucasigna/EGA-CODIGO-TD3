@@ -206,6 +206,32 @@ static float step_angle_by_5(float angle, int direction)
     return angle_normalize(stepped);
 }
 
+static float angle_error_for_direction(float setpoint, float position, int direction)
+{
+    if (direction > 0) {
+        return angle_normalize(setpoint - position);
+    }
+
+    if (direction < 0) {
+        return -angle_normalize(position - setpoint);
+    }
+
+    return angle_shortest_error(setpoint, position);
+}
+
+
+
+static void uart_send_line(const char *text)
+{
+#if UART_USE_CONSOLE
+    printf("%s\r\n", text);
+    fflush(stdout);
+#else
+    uart_write_bytes(UART_PORT, text, strlen(text));
+    uart_write_bytes(UART_PORT, "\r\n", 2);
+#endif
+}
+
 // ============================================================
 // NVS
 // ============================================================
@@ -445,11 +471,11 @@ static void PID_Task(void *pvParameters)
     TickType_t target_verify_until = 0;
     TickType_t fine_pulse_until = 0;
     TickType_t fine_brake_until = 0;
+    int forced_direction = 0;
 
     bool moving = false;
     bool hold_brake = false;
     bool verifying_target = false;
-    bool force_reverse = false;
 
     while (1) {
         if (!moving) {
@@ -472,7 +498,7 @@ static void PID_Task(void *pvParameters)
                         integral = 0.0f;
                         hold_brake = false;
                         verifying_target = false;
-                        force_reverse = false;
+                        forced_direction = 0;
                         fine_pulse_until = 0;
                         fine_brake_until = 0;
                         if (xQueuePeek(angleQueue, &current_position, 0) == pdTRUE) {
@@ -520,7 +546,7 @@ static void PID_Task(void *pvParameters)
                         moving = false;
                         hold_brake = false;
                         verifying_target = false;
-                        force_reverse = false;
+                        forced_direction = 0;
                         fine_pulse_until = 0;
                         fine_brake_until = 0;
                         break;
@@ -537,7 +563,7 @@ static void PID_Task(void *pvParameters)
                         moving = false;
                         hold_brake = false;
                         verifying_target = false;
-                        force_reverse = false;
+                        forced_direction = 0;
                         fine_pulse_until = 0;
                         fine_brake_until = 0;
                         motor_stop();
@@ -557,7 +583,7 @@ static void PID_Task(void *pvParameters)
                         integral = 0.0f;
                         hold_brake = false;
                         verifying_target = false;
-                        force_reverse = false;
+                        forced_direction = 0;
                         fine_pulse_until = 0;
                         fine_brake_until = 0;
                         if (xQueuePeek(angleQueue, &current_position, 0) == pdTRUE) {
@@ -591,13 +617,17 @@ static void PID_Task(void *pvParameters)
                         // eje casi no cambia. Se fuerza el sentido contrario para
                         // intentar salir del bloqueo sin apagar el motor.
                         verifying_target = false;
-                        force_reverse = true;
+                        if (forced_direction == 0) {
+                            forced_direction = (error >= 0.0f) ? -1 : 1;
+                        } else {
+                            forced_direction = -forced_direction;
+                        }
                         fine_pulse_until = 0;
                         fine_brake_until = 0;
                         integral = 0.0f;
                         previous_error = 0.0f;
                         start_boost_until = xTaskGetTickCount() + pdMS_TO_TICKS(PWM_START_BOOST_MS);
-                        ESP_LOGW(TAG, "Bloqueo detectado. Cambiando sentido de giro.");
+                        ESP_LOGW(TAG, "Bloqueo detectado. Nuevo sentido forzado: %d", forced_direction);
                         break;
 
                     case CMD_REVERSE:
@@ -629,17 +659,8 @@ static void PID_Task(void *pvParameters)
                 continue;
             }
 
-            error = angle_shortest_error(setpoint, position);
-
-            if (force_reverse) {
-                // Normalmente se usa el camino angular mas corto. Ante bloqueo
-                // se invierte el sentido para intentar liberar la mecanica.
-                if (error > 0.0f) {
-                    error -= 360.0f;
-                } else {
-                    error += 360.0f;
-                }
-            }
+            float target_error = angle_shortest_error(setpoint, position);
+            error = angle_error_for_direction(setpoint, position, forced_direction);
 
             if (verifying_target) {
                 TickType_t now = xTaskGetTickCount();
@@ -653,13 +674,13 @@ static void PID_Task(void *pvParameters)
                 previous_error = error;
 
                 if ((int32_t)(now - target_verify_until) >= 0) {
-                    if (fabsf(error) <= ANGLE_ACCEPT_DEG) {
+                    if (fabsf(target_error) <= ANGLE_ACCEPT_DEG) {
                         display_msg_t display_msg;
 
                         moving = false;
                         hold_brake = true;
                         verifying_target = false;
-                        force_reverse = false;
+                        forced_direction = 0;
 
                         ESP_LOGI(TAG, "Objetivo alcanzado. Posicion: %.2f", position);
                         display_msg.type = DISPLAY_SHOW_MESSAGE;
@@ -708,7 +729,7 @@ static void PID_Task(void *pvParameters)
                 output *= 0.6f;
             }
 
-            if (fabsf(error) <= ANGLE_ACCEPT_DEG) {
+            if (fabsf(target_error) <= ANGLE_ACCEPT_DEG) {
                 TickType_t now = xTaskGetTickCount();
 
                 // Primera entrada al rango aceptado. Se congela el control y se
@@ -807,21 +828,35 @@ static void PID_Task(void *pvParameters)
 
 static void Safety_Task(void *pvParameters)
 {
-    // Supervisa el movimiento publicado por PID_Task. Si el motor recibe PWM,
-    // sigue lejos del setpoint y la posicion casi no cambia, informa bloqueo.
-    // No actua sobre el driver del motor: manda CMD_BLOCK_DETECTED al PID.
+    // Supervisa el movimiento publicado por PID_Task. Para evitar falsos
+    // bloqueos no alcanza con una lectura: se exige falta de progreso durante
+    // varios chequeos consecutivos.
     motor_state_t state;
     float reference_position = 0.0f;
+    uint8_t suspicious_count = 0;
     bool was_moving = false;
     TickType_t movement_start_tick = 0;
     TickType_t last_check_tick = 0;
+    TickType_t cooldown_until_tick = 0;
+
+    (void)pvParameters;
 
     while (1) {
         if (xQueueReceive(MotorStateQueue, &state, portMAX_DELAY) == pdTRUE) {
             TickType_t now = xTaskGetTickCount();
+            float abs_error = fabsf(state.error);
 
-            if (!state.moving) {
+            if (!state.moving || abs_error <= BLOCK_ERROR_MIN) {
                 was_moving = false;
+                suspicious_count = 0;
+                continue;
+            }
+
+            if (state.pwm <= BLOCK_PWM_MIN) {
+                continue;
+            }
+
+            if ((int32_t)(now - cooldown_until_tick) < 0) {
                 continue;
             }
 
@@ -832,6 +867,7 @@ static void Safety_Task(void *pvParameters)
                 movement_start_tick = now;
                 last_check_tick = now;
                 reference_position = state.position;
+                suspicious_count = 0;
                 continue;
             }
 
@@ -846,10 +882,26 @@ static void Safety_Task(void *pvParameters)
                 delta = 360.0f - delta;
             }
 
-            if (state.moving &&
-                state.pwm > BLOCK_PWM_MIN &&
-                fabsf(state.error) > BLOCK_ERROR_MIN &&
-                delta < BLOCK_DELTA_MIN) {
+            bool no_position_progress = delta < BLOCK_DELTA_MIN;
+
+            if (no_position_progress) {
+                if (suspicious_count < UINT8_MAX) {
+                    suspicious_count++;
+                }
+
+                ESP_LOGW(TAG,
+                         "Safety_Task: sospecha bloqueo, delta=%.2f err=%.2f pwm=%.1f checks=%u/%u",
+                         delta,
+                         state.error,
+                         state.pwm,
+                         (unsigned)suspicious_count,
+                         (unsigned)BLOCK_CONSECUTIVE_LIMIT);
+            } else {
+                suspicious_count = 0;
+                reference_position = state.position;
+            }
+
+            if (suspicious_count >= BLOCK_CONSECUTIVE_LIMIT) {
                 // El PID interpreta este comando invirtiendo el sentido de giro.
                 control_cmd_t cmd = {
                     .type = CMD_BLOCK_DETECTED,
@@ -858,14 +910,18 @@ static void Safety_Task(void *pvParameters)
 
                 xQueueSend(ControlQueue, &cmd, 0);
 
-                ESP_LOGW(TAG, "Safety_Task: bloqueo detectado, delta=%.2f err=%.2f pwm=%.1f",
+                ESP_LOGW(TAG,
+                         "Safety_Task: bloqueo detectado, delta=%.2f err=%.2f pwm=%.1f checks=%u",
                          delta,
                          state.error,
-                         state.pwm);
+                         state.pwm,
+                         (unsigned)suspicious_count);
+
+                suspicious_count = 0;
                 was_moving = false;
+                cooldown_until_tick = now + pdMS_TO_TICKS(BLOCK_COOLDOWN_MS);
             }
 
-            reference_position = state.position;
             last_check_tick = now;
         }
     }
@@ -920,12 +976,47 @@ static void UART_Command_Task(void *pvParameters)
             }
         }
 #else
-        int len = uart_read_bytes(UART_PORT, data, UART_BUF_SIZE - 1, portMAX_DELAY);
+        int len = 0;
 
-        if (len > 0) {
-            data[len] = '\0';
+        while (1) {
+            uint8_t ch;
+            int rx_len = uart_read_bytes(UART_PORT, &ch, 1, portMAX_DELAY);
+
+            if (rx_len <= 0) {
+                continue;
+            }
+
+            if (ch == '\r' || ch == '\n') {
+                if (len == 0) {
+                    continue;
+                }
+
+                data[len] = '\0';
+                break;
+            }
+
+            if (ch < 32 || ch == 0x7F) {
+                continue;
+            }
+
+            if (len < (UART_BUF_SIZE - 1)) {
+                data[len] = ch;
+                len++;
+            }
         }
 #endif
+
+        // Ignora bytes de control que algunos monitores serie envian con atajos
+        // como Ctrl+C, y recorta CR/LF del final del comando.
+        while (len > 0 && data[0] < 32 && data[0] != '\r' && data[0] != '\n') {
+            memmove(data, data + 1, len);
+            len--;
+        }
+
+        while (len > 0 && (data[len - 1] == '\r' || data[len - 1] == '\n')) {
+            data[len - 1] = '\0';
+            len--;
+        }
 
         if (len > 0) {
             ESP_LOGI(TAG, "UART RX: %s", (char *)data);
@@ -1057,8 +1148,7 @@ static void UART_Command_Task(void *pvParameters)
                 ESP_LOGW(TAG, "Comando UART no reconocido");
             }
 
-            printf("%s\r\n", command_ok ? "OK" : "ERROR");
-            fflush(stdout);
+            uart_send_line(command_ok ? "OK" : "ERROR");
         }
     }
 }
