@@ -28,6 +28,9 @@
 
 // Convencion mecanica: los angulos deben aumentar en sentido antihorario.
 #define ANGLE_CCW_POSITIVE  1
+// Calibracion mecanica de la aguja: valor que lee el sensor cuando la aguja
+// esta fisicamente en 0 grados. Ejemplo: si en cero lee 274.2, poner 274.2f.
+#define ANGLE_ZERO_OFFSET_DEG 280.0f
 
 // UART comandos PC
 // UART_USE_CONSOLE=1 permite mandar comandos desde el mismo monitor USB usado
@@ -68,10 +71,11 @@
 #define AS5600_PERIOD_MS    10
 
 #define ANGLE_TOLERANCE_DEG 0.7f
-#define ANGLE_ACCEPT_DEG    0.5f
+#define ANGLE_ACCEPT_DEG    0.7f
 
 // El motor necesita un PWM alto para empezar a moverse. Cerca del objetivo se
-// usan pulsos mas suaves para no pasarse por inercia.
+// usan pulsos mas suaves para no pasarse por inercia. Si un bloqueo obligo a
+// tomar el camino largo, al acercarse al setpoint se vuelve al camino corto.
 #define PWM_MAX             1023.0f
 #define PWM_MIN             150.0f
 #define PWM_MOVE_MIN        750.0f
@@ -80,6 +84,7 @@
 #define PWM_START_BOOST_MS  300
 #define TARGET_VERIFY_MS    60
 #define FINE_CONTROL_ZONE_DEG 2.0f
+#define FORCED_DIRECTION_RELEASE_DEG 10.0f
 #define FINE_PULSE_MS       20
 #define FINE_BRAKE_MS       120
 

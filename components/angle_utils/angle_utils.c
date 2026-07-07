@@ -44,5 +44,9 @@ float angle_raw_to_degrees(uint16_t raw)
     angle = 360.0f - angle;
 #endif
 
+    // Ajuste de cero mecanico: permite alinear la lectura del sensor con la
+    // aguja/indicador real montado sobre el eje.
+    angle -= ANGLE_ZERO_OFFSET_DEG;
+
     return angle_normalize(angle);
 }

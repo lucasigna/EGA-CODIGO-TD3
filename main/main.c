@@ -662,6 +662,20 @@ static void PID_Task(void *pvParameters)
             float target_error = angle_shortest_error(setpoint, position);
             error = angle_error_for_direction(setpoint, position, forced_direction);
 
+            if (forced_direction != 0 && fabsf(target_error) <= FORCED_DIRECTION_RELEASE_DEG) {
+                // El bloqueo puede obligar a tomar el camino largo. Cuando ya
+                // estamos cerca del objetivo, se libera esa restriccion para
+                // evitar que el eje pase de largo y complete otra vuelta.
+                forced_direction = 0;
+                error = target_error;
+                integral = 0.0f;
+                previous_error = error;
+                fine_pulse_until = 0;
+                fine_brake_until = 0;
+                start_boost_until = 0;
+                ESP_LOGI(TAG, "Liberando sentido forzado cerca del objetivo: err=%.2f", target_error);
+            }
+
             if (verifying_target) {
                 TickType_t now = xTaskGetTickCount();
 
