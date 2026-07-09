@@ -15,7 +15,7 @@
 
 // I2C compartido: AS5600 + LCD
 #define PIN_I2C_SDA         GPIO_NUM_8
-#define PIN_I2C_SCL         GPIO_NUM_9
+#define PIN_I2C_SCL         GPIO_NUM_7
 
 // Botones
 #define PIN_BTN_PLUS        GPIO_NUM_10
@@ -30,7 +30,7 @@
 #define ANGLE_CCW_POSITIVE  1
 // Calibracion mecanica de la aguja: valor que lee el sensor cuando la aguja
 // esta fisicamente en 0 grados. Ejemplo: si en cero lee 274.2, poner 274.2f.
-#define ANGLE_ZERO_OFFSET_DEG 280.0f
+#define ANGLE_ZERO_OFFSET_DEG 200.0f
 
 // UART comandos PC
 // UART_USE_CONSOLE=1 permite mandar comandos desde el mismo monitor USB usado
@@ -65,13 +65,12 @@
 #define UART_BUF_SIZE       256
 
 // Control
-// ANGLE_TOLERANCE_DEG es la tolerancia estricta para entrar en verificacion.
-// ANGLE_ACCEPT_DEG es la tolerancia final aceptada luego de frenar y esperar.
+// Tolerancia final de posicion. Debe ser mayor que la zona muerta mecanica:
+// si el motor queda clavado a ~1 grado, pedir menos lo deja corrigiendo en loop.
 #define PID_PERIOD_MS       10
 #define AS5600_PERIOD_MS    10
 
-#define ANGLE_TOLERANCE_DEG 0.7f
-#define ANGLE_ACCEPT_DEG    0.7f
+#define ANGLE_ACCEPT_DEG    1.5f
 
 // El motor necesita un PWM alto para empezar a moverse. Cerca del objetivo se
 // usan pulsos mas suaves para no pasarse por inercia. Si un bloqueo obligo a

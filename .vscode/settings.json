@@ -16,6 +16,6 @@
     "IDF_CCACHE_ENABLE": "1",
     "IDF_TARGET": "esp32s3"
   },
-  "idf.portWin": "COM9",
+  "idf.portWin": "COM10",
   "idf.flashType": "UART"
 }

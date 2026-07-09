@@ -698,8 +698,8 @@ static void PID_Task(void *pvParameters)
 
                         ESP_LOGI(TAG, "Objetivo alcanzado. Posicion: %.2f", position);
                         display_msg.type = DISPLAY_SHOW_MESSAGE;
-                        display_msg.value = position;
-                        snprintf(display_msg.text, sizeof(display_msg.text), "OK %.1f deg", position);
+                        display_msg.value = setpoint;
+                        snprintf(display_msg.text, sizeof(display_msg.text), "OK %.1f deg", setpoint);
                         xQueueSend(DisplayQueue, &display_msg, 0);
                     } else {
                         verifying_target = false;
@@ -815,7 +815,13 @@ static void PID_Task(void *pvParameters)
             motor_state.position = position;
             motor_state.error = error;
             motor_state.pwm = fabsf(output);
-            motor_state.direction = (output >= 0.0f) ? 1 : -1;
+            if (output > 0.0f) {
+                motor_state.direction = 1;
+            } else if (output < 0.0f) {
+                motor_state.direction = -1;
+            } else {
+                motor_state.direction = 0;
+            }
             motor_state.moving = moving;
 
             xQueueOverwrite(MotorStateQueue, &motor_state);
