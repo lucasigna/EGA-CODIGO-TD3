@@ -7,7 +7,6 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
-#include "freertos/semphr.h"
 
 #include "driver/gpio.h"
 #include "driver/i2c.h"
@@ -116,6 +115,18 @@ typedef enum {
     MENU_COUNT
 } ui_menu_t;
 
+typedef enum {
+    BUTTON_PLUS = 0,
+    BUTTON_MINUS,
+    BUTTON_MENU,
+    BUTTON_OK
+} button_id_t;
+
+typedef struct {
+    button_id_t button;
+    TickType_t tick;
+} button_event_t;
+
 // Configuracion persistente. Se guarda como un blob completo en NVS para que
 // al reiniciar se recuperen setpoint, constantes PID y perfil.
 typedef struct {
@@ -137,7 +148,7 @@ typedef struct {
 } config_msg_t;
 
 // ============================================================
-// COLAS Y SEMÁFOROS
+// COLAS
 // ============================================================
 
 // Las colas separan responsabilidades:
@@ -147,6 +158,7 @@ typedef struct {
 // MotorStateQueue permite que Safety_Task observe el movimiento.
 // DisplayQueue desacopla mensajes de pantalla del driver LCD.
 // ConfigQueue concentra escrituras/lecturas de NVS en Storage_Task.
+// ButtonEventQueue lleva flancos de botones desde la ISR hacia ButtonHandler_Task.
 static QueueHandle_t ControlQueue;
 static QueueHandle_t I2C_TXQueue;
 static QueueHandle_t I2C_RXQueue;
@@ -154,11 +166,7 @@ static QueueHandle_t angleQueue;
 static QueueHandle_t MotorStateQueue;
 static QueueHandle_t DisplayQueue;
 static QueueHandle_t ConfigQueue;
-
-static SemaphoreHandle_t sem_btn_plus;
-static SemaphoreHandle_t sem_btn_minus;
-static SemaphoreHandle_t sem_btn_menu;
-static SemaphoreHandle_t sem_btn_ok;
+static QueueHandle_t ButtonEventQueue;
 
 // Tiempos usados por la ISR para antirrebote por software.
 static volatile TickType_t last_btn_plus_tick;
@@ -183,11 +191,13 @@ static system_config_t g_config = {
 // FUNCIONES AUXILIARES
 // ============================================================
 
-static void drain_button_semaphore(SemaphoreHandle_t sem)
+static void drain_button_queue(void)
 {
+    button_event_t discarded;
+
     // Descartar eventos acumulados evita que un rebote viejo se interprete
     // como una nueva accion de usuario.
-    while (xSemaphoreTake(sem, 0) == pdTRUE) {
+    while (xQueueReceive(ButtonEventQueue, &discarded, 0) == pdTRUE) {
     }
 }
 
@@ -300,29 +310,37 @@ static void IRAM_ATTR gpio_button_isr_handler(void *arg)
     TickType_t now = xTaskGetTickCountFromISR();
     TickType_t debounce_ticks = pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS);
     volatile TickType_t *last_tick = NULL;
-    SemaphoreHandle_t sem = NULL;
+    button_event_t event;
     BaseType_t higher_priority_task_woken = pdFALSE;
 
     if (pin == PIN_BTN_PLUS) {
-        sem = sem_btn_plus;
+        event.button = BUTTON_PLUS;
         last_tick = &last_btn_plus_tick;
     } else if (pin == PIN_BTN_MINUS) {
-        sem = sem_btn_minus;
+        event.button = BUTTON_MINUS;
         last_tick = &last_btn_minus_tick;
     } else if (pin == PIN_BTN_MENU) {
-        sem = sem_btn_menu;
+        event.button = BUTTON_MENU;
         last_tick = &last_btn_menu_tick;
     } else if (pin == PIN_BTN_OK) {
-        sem = sem_btn_ok;
+        event.button = BUTTON_OK;
         last_tick = &last_btn_ok_tick;
+    } else {
+        return;
     }
 
-    if (sem != NULL && last_tick != NULL &&
+    event.tick = now;
+
+    if (last_tick != NULL &&
         (*last_tick == 0 || (now - *last_tick) >= debounce_ticks)) {
-        // La ISR solo avisa el evento con un semaforo. La logica de menu queda
-        // en ButtonHandler_Task, fuera de la interrupcion.
+        // La ISR solo empaqueta que boton genero el flanco. La logica de menu
+        // queda en ButtonHandler_Task, fuera de la interrupcion.
+        if (ButtonEventQueue == NULL) {
+            return;
+        }
+
         *last_tick = now;
-        xSemaphoreGiveFromISR(sem, &higher_priority_task_woken);
+        xQueueSendFromISR(ButtonEventQueue, &event, &higher_priority_task_woken);
     }
 
     portYIELD_FROM_ISR(higher_priority_task_woken);
@@ -763,7 +781,7 @@ static void PID_Task(void *pvParameters)
 
                 TickType_t control_now = xTaskGetTickCount();
 
-                if (fabsf(error) <= FINE_CONTROL_ZONE_DEG) {
+                if (fabsf(target_error) <= FINE_CONTROL_ZONE_DEG) {
                     // Cerca del objetivo se usa un PWM menor que el de movimiento
                     // normal. Con mas tension de alimentacion, el mismo duty
                     // genera un empujon mas fuerte.
@@ -1174,7 +1192,7 @@ static void UART_Command_Task(void *pvParameters)
 }
 
 // ============================================================
-// TASK: BUTTON_HANDLER_TASK - PRIORIDAD 1
+// TASK: BUTTON_HANDLER_TASK - PRIORIDAD 3
 // ============================================================
 
 static void ButtonHandler_Task(void *pvParameters)
@@ -1203,7 +1221,18 @@ static void ButtonHandler_Task(void *pvParameters)
     xQueueSend(DisplayQueue, &display_msg, 0);
 
     while (1) {
-        if (xSemaphoreTake(sem_btn_menu, 0) == pdTRUE) {
+        button_event_t button_event;
+        BaseType_t event_received = xQueueReceive(
+            ButtonEventQueue,
+            &button_event,
+            pdMS_TO_TICKS(20)
+        );
+        bool menu_pressed = event_received == pdTRUE && button_event.button == BUTTON_MENU;
+        bool ok_pressed = event_received == pdTRUE && button_event.button == BUTTON_OK;
+        BaseType_t plus_edge = (event_received == pdTRUE && button_event.button == BUTTON_PLUS) ? pdTRUE : pdFALSE;
+        BaseType_t minus_edge = (event_received == pdTRUE && button_event.button == BUTTON_MINUS) ? pdTRUE : pdFALSE;
+
+        if (menu_pressed) {
             // MENU solo cambia la pantalla activa; no mueve el motor.
             menu = (ui_menu_t)((menu + 1) % MENU_COUNT);
             next_plus_repeat_tick = 0;
@@ -1245,17 +1274,13 @@ static void ButtonHandler_Task(void *pvParameters)
 
             xQueueSend(DisplayQueue, &display_msg, 0);
             vTaskDelay(pdMS_TO_TICKS(150));
-            drain_button_semaphore(sem_btn_plus);
-            drain_button_semaphore(sem_btn_minus);
-            drain_button_semaphore(sem_btn_ok);
+            drain_button_queue();
             continue;
         }
 
         TickType_t now = xTaskGetTickCount();
         bool plus_is_down = gpio_get_level(PIN_BTN_PLUS) == 1;
         bool minus_is_down = gpio_get_level(PIN_BTN_MINUS) == 1;
-        BaseType_t plus_edge = xSemaphoreTake(sem_btn_plus, 0);
-        BaseType_t minus_edge = xSemaphoreTake(sem_btn_minus, 0);
         BaseType_t plus_pressed = pdFALSE;
         BaseType_t minus_pressed = pdFALSE;
 
@@ -1363,12 +1388,11 @@ static void ButtonHandler_Task(void *pvParameters)
 
             xQueueSend(DisplayQueue, &display_msg, 0);
             vTaskDelay(pdMS_TO_TICKS(150));
-            drain_button_semaphore(sem_btn_menu);
-            drain_button_semaphore(sem_btn_ok);
+            drain_button_queue();
             continue;
         }
 
-        if (xSemaphoreTake(sem_btn_ok, 0) == pdTRUE) {
+        if (ok_pressed) {
             next_plus_repeat_tick = 0;
             next_minus_repeat_tick = 0;
 
@@ -1398,43 +1422,13 @@ static void ButtonHandler_Task(void *pvParameters)
             }
 
             vTaskDelay(pdMS_TO_TICKS(150));
-            drain_button_semaphore(sem_btn_plus);
-            drain_button_semaphore(sem_btn_minus);
-            drain_button_semaphore(sem_btn_menu);
-            drain_button_semaphore(sem_btn_ok);
+            drain_button_queue();
             continue;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(20));
-        continue;
-
-        if (xSemaphoreTake(sem_btn_ok, 0) == pdTRUE) {
-            // Botón OK -> PID
-            control_cmd.type = CMD_SET_PROFILE;
-            control_cmd.value = (float)selected_profile;
-            xQueueSend(ControlQueue, &control_cmd, portMAX_DELAY);
-
-            control_cmd.type = CMD_SET_ANGLE;
-            control_cmd.value = selected_angle;
-            xQueueSend(ControlQueue, &control_cmd, portMAX_DELAY);
-
-            // Botón OK -> Storage
-            g_config.setpoint = selected_angle;
-            g_config.profile = selected_profile;
-
-            config_msg.type = CONFIG_SAVE_ALL;
-            config_msg.config = g_config;
-            xQueueSend(ConfigQueue, &config_msg, 0);
-
-            // Botón OK -> Display
-            display_msg.type = DISPLAY_SHOW_MESSAGE;
-            snprintf(display_msg.text, sizeof(display_msg.text), "Moving %.1f", selected_angle);
-            xQueueSend(DisplayQueue, &display_msg, 0);
-
-            vTaskDelay(pdMS_TO_TICKS(150));
+        if (event_received != pdTRUE) {
+            continue;
         }
-
-        vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
 
@@ -1511,7 +1505,6 @@ static void Display_Task(void *pvParameters)
         }
     }
 }
-
 // ============================================================
 // TASK: STORAGE_TASK - PRIORIDAD 1
 // ============================================================
@@ -1734,6 +1727,7 @@ void app_main(void)
     // MotorStateQueue: PID_Task -> Safety_Task.
     // DisplayQueue: UI/UART/PID/Storage -> Display_Task.
     // ConfigQueue: UI/UART -> Storage_Task.
+    // ButtonEventQueue: ISR botones -> ButtonHandler_Task.
     // I2C_TXQueue/I2C_RXQueue: AS5600/LCD tasks -> I2C_Manager_Task.
     ControlQueue = xQueueCreate(10, sizeof(control_cmd_t));
     I2C_TXQueue = xQueueCreate(10, sizeof(i2c_request_t));
@@ -1744,11 +1738,7 @@ void app_main(void)
 
     DisplayQueue = xQueueCreate(10, sizeof(display_msg_t));
     ConfigQueue = xQueueCreate(5, sizeof(config_msg_t));
-
-    sem_btn_plus = xSemaphoreCreateBinary();
-    sem_btn_minus = xSemaphoreCreateBinary();
-    sem_btn_menu = xSemaphoreCreateBinary();
-    sem_btn_ok = xSemaphoreCreateBinary();
+    ButtonEventQueue = xQueueCreate(10, sizeof(button_event_t));
 
     if (!ControlQueue ||
         !I2C_TXQueue ||
@@ -1757,12 +1747,9 @@ void app_main(void)
         !MotorStateQueue ||
         !DisplayQueue ||
         !ConfigQueue ||
-        !sem_btn_plus ||
-        !sem_btn_minus ||
-        !sem_btn_menu ||
-        !sem_btn_ok) {
+        !ButtonEventQueue) {
 
-        ESP_LOGE(TAG, "Error creando colas o semáforos");
+        ESP_LOGE(TAG, "Error creando colas");
         return;
     }
 
@@ -1770,13 +1757,14 @@ void app_main(void)
     xTaskCreate(PID_Task, "PID_Task", 4096, NULL, 3, NULL);
     xTaskCreate(I2C_Manager_Task, "I2C_Manager_Task", 4096, NULL, 3, NULL);
     xTaskCreate(AS5600_Reader_Task, "AS5600_Reader_Task", 4096, NULL, 3, NULL);
+    xTaskCreate(ButtonHandler_Task, "ButtonHandler_Task", 4096, NULL, 3, NULL);
 
     // Prioridad 2
     xTaskCreate(Safety_Task, "Safety_Task", 4096, NULL, 2, NULL);
     xTaskCreate(UART_Command_Task, "UART_Command_Task", 4096, NULL, 2, NULL);
 
+
     // Prioridad 1
-    xTaskCreate(ButtonHandler_Task, "ButtonHandler_Task", 4096, NULL, 1, NULL);
     xTaskCreate(Display_Task, "Display_Task", 4096, NULL, 1, NULL);
     xTaskCreate(Storage_Task, "Storage_Task", 4096, NULL, 1, NULL);
 
