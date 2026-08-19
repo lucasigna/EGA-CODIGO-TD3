@@ -69,8 +69,9 @@
 // si el motor queda clavado a ~1 grado, pedir menos lo deja corrigiendo en loop.
 #define PID_PERIOD_MS       10
 #define AS5600_PERIOD_MS    10
+#define RAMP_SPEED_DEG_S    30.0f
 
-#define ANGLE_ACCEPT_DEG    1.5f
+#define ANGLE_ACCEPT_DEG    2.0f
 
 // El motor necesita un PWM alto para empezar a moverse. Cerca del objetivo se
 // usan pulsos mas suaves para no pasarse por inercia. Si un bloqueo obligo a

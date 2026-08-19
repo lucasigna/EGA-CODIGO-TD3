@@ -480,6 +480,8 @@ static void PID_Task(void *pvParameters)
 
     float position = 0.0f;
     float error = 0.0f;
+    float target_error = 0.0f;
+    float control_setpoint = setpoint;
     float previous_error = 0.0f;
     float integral = 0.0f;
     float derivative = 0.0f;
@@ -494,6 +496,7 @@ static void PID_Task(void *pvParameters)
     bool moving = false;
     bool hold_brake = false;
     bool verifying_target = false;
+    bool ramp_initialized = false;
 
     while (1) {
         if (!moving) {
@@ -513,14 +516,23 @@ static void PID_Task(void *pvParameters)
                         // Nuevo objetivo: se reinician estados dinamicos del PID
                         // para no arrastrar integral/derivada de otro movimiento.
                         setpoint = angle_normalize(cmd.value);
+                        control_setpoint = setpoint;
                         integral = 0.0f;
                         hold_brake = false;
                         verifying_target = false;
                         forced_direction = 0;
+                        ramp_initialized = profile != PROFILE_RAMPA;
                         fine_pulse_until = 0;
                         fine_brake_until = 0;
                         if (xQueuePeek(angleQueue, &current_position, 0) == pdTRUE) {
-                            previous_error = angle_shortest_error(setpoint, current_position);
+                            if (profile == PROFILE_RAMPA) {
+                                control_setpoint = current_position;
+                                ramp_initialized = true;
+                                previous_error = 0.0f;
+                            } else {
+                                ramp_initialized = true;
+                                previous_error = angle_shortest_error(control_setpoint, current_position);
+                            }
                         } else {
                             previous_error = 0.0f;
                         }
@@ -545,10 +557,29 @@ static void PID_Task(void *pvParameters)
                         ESP_LOGI(TAG, "Kd = %.3f", kd);
                         break;
 
-                    case CMD_SET_PROFILE:
+                    case CMD_SET_PROFILE: {
+                        float current_position = 0.0f;
+
                         profile = (movement_profile_t)((int)cmd.value);
+                        integral = 0.0f;
+                        previous_error = 0.0f;
+
+                        if (profile == PROFILE_ESCALON) {
+                            control_setpoint = setpoint;
+                            ramp_initialized = true;
+                            if (xQueuePeek(angleQueue, &current_position, 0) == pdTRUE) {
+                                previous_error = angle_shortest_error(control_setpoint, current_position);
+                            }
+                        } else if (xQueuePeek(angleQueue, &current_position, 0) == pdTRUE) {
+                            control_setpoint = current_position;
+                            ramp_initialized = true;
+                        } else {
+                            ramp_initialized = false;
+                        }
+
                         ESP_LOGI(TAG, "Profile = %d", profile);
                         break;
+                    }
 
                     case CMD_LOAD_CONFIG:
                         setpoint = g_config.setpoint;
@@ -556,6 +587,8 @@ static void PID_Task(void *pvParameters)
                         ki = g_config.ki;
                         kd = g_config.kd;
                         profile = g_config.profile;
+                        control_setpoint = setpoint;
+                        ramp_initialized = profile != PROFILE_RAMPA;
                         ESP_LOGI(TAG, "Config cargada en PID");
                         break;
 
@@ -565,6 +598,8 @@ static void PID_Task(void *pvParameters)
                         hold_brake = false;
                         verifying_target = false;
                         forced_direction = 0;
+                        control_setpoint = setpoint;
+                        ramp_initialized = false;
                         fine_pulse_until = 0;
                         fine_brake_until = 0;
                         break;
@@ -582,6 +617,8 @@ static void PID_Task(void *pvParameters)
                         hold_brake = false;
                         verifying_target = false;
                         forced_direction = 0;
+                        control_setpoint = setpoint;
+                        ramp_initialized = false;
                         fine_pulse_until = 0;
                         fine_brake_until = 0;
                         motor_stop();
@@ -598,14 +635,23 @@ static void PID_Task(void *pvParameters)
                         }
 
                         setpoint = new_setpoint;
+                        control_setpoint = setpoint;
                         integral = 0.0f;
                         hold_brake = false;
                         verifying_target = false;
                         forced_direction = 0;
+                        ramp_initialized = profile != PROFILE_RAMPA;
                         fine_pulse_until = 0;
                         fine_brake_until = 0;
                         if (xQueuePeek(angleQueue, &current_position, 0) == pdTRUE) {
-                            previous_error = angle_shortest_error(setpoint, current_position);
+                            if (profile == PROFILE_RAMPA) {
+                                control_setpoint = current_position;
+                                ramp_initialized = true;
+                                previous_error = 0.0f;
+                            } else {
+                                ramp_initialized = true;
+                                previous_error = angle_shortest_error(control_setpoint, current_position);
+                            }
                         } else {
                             previous_error = 0.0f;
                         }
@@ -626,9 +672,27 @@ static void PID_Task(void *pvParameters)
                         kd = cmd.value;
                         break;
 
-                    case CMD_SET_PROFILE:
+                    case CMD_SET_PROFILE: {
+                        float current_position = 0.0f;
+
                         profile = (movement_profile_t)((int)cmd.value);
+                        integral = 0.0f;
+                        previous_error = 0.0f;
+
+                        if (profile == PROFILE_ESCALON) {
+                            control_setpoint = setpoint;
+                            ramp_initialized = true;
+                            if (xQueuePeek(angleQueue, &current_position, 0) == pdTRUE) {
+                                previous_error = angle_shortest_error(control_setpoint, current_position);
+                            }
+                        } else if (xQueuePeek(angleQueue, &current_position, 0) == pdTRUE) {
+                            control_setpoint = current_position;
+                            ramp_initialized = true;
+                        } else {
+                            ramp_initialized = false;
+                        }
                         break;
+                    }
 
                     case CMD_BLOCK_DETECTED:
                         // Safety_Task detecto que hay PWM y error alto, pero el
@@ -660,6 +724,8 @@ static void PID_Task(void *pvParameters)
                         ki = g_config.ki;
                         kd = g_config.kd;
                         profile = g_config.profile;
+                        control_setpoint = setpoint;
+                        ramp_initialized = profile != PROFILE_RAMPA;
                         break;
 
                     default:
@@ -677,23 +743,60 @@ static void PID_Task(void *pvParameters)
                 continue;
             }
 
-            float target_error = angle_shortest_error(setpoint, position);
-            error = angle_error_for_direction(setpoint, position, forced_direction);
+            float dt = PID_PERIOD_MS / 1000.0f;
+            target_error = angle_shortest_error(setpoint, position);
+
+            if (forced_direction != 0) {
+                error = angle_error_for_direction(setpoint, position, forced_direction);
+            } else if (profile == PROFILE_RAMPA) {
+                if (!ramp_initialized) {
+                    control_setpoint = position;
+                    ramp_initialized = true;
+                    integral = 0.0f;
+                    previous_error = 0.0f;
+                }
+
+                float remaining = angle_shortest_error(setpoint, control_setpoint);
+                float max_ramp_step = RAMP_SPEED_DEG_S * dt;
+
+                if (fabsf(remaining) <= max_ramp_step) {
+                    control_setpoint = setpoint;
+                } else {
+                    control_setpoint = angle_normalize(
+                        control_setpoint + ((remaining > 0.0f) ? max_ramp_step : -max_ramp_step)
+                    );
+                }
+
+                error = angle_shortest_error(control_setpoint, position);
+            } else {
+                control_setpoint = setpoint;
+                ramp_initialized = true;
+                error = target_error;
+            }
 
             if (forced_direction != 0 && fabsf(target_error) <= FORCED_DIRECTION_RELEASE_DEG) {
                 // El bloqueo puede obligar a tomar el camino largo. Cuando ya
                 // estamos cerca del objetivo, se libera esa restriccion para
                 // evitar que el eje pase de largo y complete otra vuelta.
                 forced_direction = 0;
-                error = target_error;
                 integral = 0.0f;
-                previous_error = error;
                 fine_pulse_until = 0;
                 fine_brake_until = 0;
                 start_boost_until = 0;
+
+                if (profile == PROFILE_RAMPA) {
+                    control_setpoint = position;
+                    ramp_initialized = true;
+                    error = 0.0f;
+                } else {
+                    control_setpoint = setpoint;
+                    ramp_initialized = true;
+                    error = target_error;
+                }
+
+                previous_error = error;
                 ESP_LOGI(TAG, "Liberando sentido forzado cerca del objetivo: err=%.2f", target_error);
             }
-
             if (verifying_target) {
                 TickType_t now = xTaskGetTickCount();
 
@@ -713,7 +816,8 @@ static void PID_Task(void *pvParameters)
                         hold_brake = true;
                         verifying_target = false;
                         forced_direction = 0;
-
+                        control_setpoint = setpoint;
+                        ramp_initialized = false;
                         ESP_LOGI(TAG, "Objetivo alcanzado. Posicion: %.2f", position);
                         display_msg.type = DISPLAY_SHOW_MESSAGE;
                         display_msg.value = setpoint;
@@ -727,7 +831,7 @@ static void PID_Task(void *pvParameters)
 
                 motor_state.setpoint = setpoint;
                 motor_state.position = position;
-                motor_state.error = error;
+                motor_state.error = target_error;
                 motor_state.pwm = 0.0f;
                 motor_state.direction = 0;
                 motor_state.moving = moving;
@@ -737,8 +841,6 @@ static void PID_Task(void *pvParameters)
                 vTaskDelayUntil(&last_wake, period);
                 continue;
             }
-
-            float dt = PID_PERIOD_MS / 1000.0f;
 
             integral += error * dt;
 
@@ -756,10 +858,6 @@ static void PID_Task(void *pvParameters)
 
             output = kp * error + ki * integral + kd * derivative;
 
-            // Perfil RAMPA: misma consigna, pero con salida suavizada.
-            if (profile == PROFILE_RAMPA) {
-                output *= 0.6f;
-            }
 
             if (fabsf(target_error) <= ANGLE_ACCEPT_DEG) {
                 TickType_t now = xTaskGetTickCount();
@@ -797,7 +895,7 @@ static void PID_Task(void *pvParameters)
                         }
 
                         if ((int32_t)(control_now - fine_pulse_until) < 0) {
-                            output = (error >= 0.0f) ? PWM_FINE_MIN : -PWM_FINE_MIN;
+                            output = (target_error >= 0.0f) ? PWM_FINE_MIN : -PWM_FINE_MIN;
                             motor_apply(output);
                         } else {
                             fine_pulse_until = 0;
@@ -831,7 +929,7 @@ static void PID_Task(void *pvParameters)
 
             motor_state.setpoint = setpoint;
             motor_state.position = position;
-            motor_state.error = error;
+            motor_state.error = target_error;
             motor_state.pwm = fabsf(output);
             if (output > 0.0f) {
                 motor_state.direction = 1;
@@ -846,12 +944,24 @@ static void PID_Task(void *pvParameters)
 
             TickType_t now = xTaskGetTickCount();
             if ((now - last_pid_log) >= pdMS_TO_TICKS(250)) {
-                ESP_LOGI(TAG, "PID sp=%.2f pos=%.2f err=%.2f out=%.2f dir=%d",
-                         setpoint,
-                         position,
-                         error,
-                         output,
-                         motor_state.direction);
+                if (profile == PROFILE_RAMPA && forced_direction == 0) {
+                    ESP_LOGI(TAG,
+                             "PID target=%.2f ramp_sp=%.2f pos=%.2f pid_err=%.2f target_err=%.2f out=%.2f dir=%d",
+                             setpoint,
+                             control_setpoint,
+                             position,
+                             error,
+                             target_error,
+                             output,
+                             motor_state.direction);
+                } else {
+                    ESP_LOGI(TAG, "PID sp=%.2f pos=%.2f err=%.2f out=%.2f dir=%d",
+                             setpoint,
+                             position,
+                             error,
+                             output,
+                             motor_state.direction);
+                }
                 last_pid_log = now;
             }
 
